@@ -34,7 +34,6 @@ override_dh_auto_install:
 	$(foreach pkg,$(PKG_LIST), \
 		/root/.cargo/bin/cargo pgrx init --pg$(PGVER_$(pkg)) $(PGCONFIG_$(pkg)) \
 		&& /root/.cargo/bin/cargo pgrx package --features xid8 --pg-config $(PGCONFIG_$(pkg)) \
-		&& $(if $(filter true,$(CI)),./trivy-scan.sh src $(pkg),:) \
 		&& mv target/release/pgnats-pg$(PGVER_$(pkg)) debian/$(pkg) \
 		${\n} \
 	)

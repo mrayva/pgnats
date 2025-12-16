@@ -73,10 +73,6 @@ if [[ ! -f %{_builddir}/%{name}-%{version}/Cargo.toml ]]; then
 fi
 
 %install
-
-cargo --version
-rustc --version
-
 cd %{_builddir}/%{name}-%{version}
 
 %if 0%{?el8} || 0%{?el9}
