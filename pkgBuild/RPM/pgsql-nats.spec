@@ -9,6 +9,7 @@
 %if 0%{?redos}   == 07
 %define          dist .redos%{redos_ver}
 %endif
+%{?is_opensuse: %define  dist       .mosos}
 
 Name:           pgsql%{pg_ver}-nats
 Summary:        NATS connect for PostgreSQL
@@ -19,28 +20,28 @@ URL:            https://github.com/luxms/pgnats
 License:        CorpGPL
 SOURCE0:		pgsql-nats-v%{version}.tar.gz
 
-BuildRequires:  rust rustfmt cargo cargo-pgrx openssl
+Requires:       postgresql%{pg_ver}-server
+BuildRequires:  cargo-pgrx openssl clang
 
 %if 0%{?redos}
-Requires:       postgresql%{pg_ver}-server
-BuildRequires:  postgresql%{pg_ver}-devel
+BuildRequires:  rust rustfmt cargo postgresql%{pg_ver}-devel
 Disttag:        redos%{redos_ver}
-Distribution:   redos/%{redos_ver}/x86_64
 %endif
 
 %if 0%{?el8} || 0%{?el9}
-
 %if 0%{?pg_ver} < 17
 Requires:       postgresql-server >= %{pg_ver} postgresql-server < %(echo $((%{pg_ver} + 1)))
 BuildRequires:  postgresql-server-devel >= %{pg_ver} postgresql-server-devel < %(echo $((%{pg_ver} + 1)))
 %else
-Requires:       postgresql%{pg_ver}-server
 BuildRequires:  postgresql%{pg_ver}-devel
 %endif
-
-BuildRequires:  clang
+BuildRequires:  rust rustfmt cargo
 Disttag:        el%{rhel}
-Distribution:   el/%{rhel}/x86_64
+%endif
+
+%if 0%{?is_opensuse}
+BuildRequires:  postgresql%{pg_ver}-server-devel
+Disttag:        mosos
 %endif
 
 %description
@@ -111,6 +112,15 @@ cargo pgrx package --features xid8 --pg-config /opt/pgpro/ent-%{pg_ver}/bin/pg_c
 rm -rf target
 %endif
 
+%if 0%{?is_opensuse}
+cargo pgrx init --pg%{pg_ver} /usr/lib/postgresql%{pg_ver}/bin/pg_config --skip-version-check
+cargo pgrx package --pg-config /usr/lib/postgresql%{pg_ver}/bin/pg_config
+%{__mkdir_p} %{buildroot}/usr/lib/postgresql%{pg_ver}/lib64 %{buildroot}/usr/share/postgresql%{pg_ver}/extension
+%{__mv} target/release/pgnats-pg%{pg_ver}/usr/lib/postgresql%{pg_ver}/lib64/* %{buildroot}/usr/lib/postgresql%{pg_ver}/lib64/
+%{__mv} target/release/pgnats-pg%{pg_ver}/usr/share/postgresql%{pg_ver}/extension/* %{buildroot}/usr/share/postgresql%{pg_ver}/extension/
+rm -rf target
+%endif
+
 
 %files
 %if 0%{?el8} || 0%{?el9}
@@ -136,6 +146,11 @@ rm -rf target
 %files -n pgpro%{pg_ver}ent-nats
 /opt/pgpro/ent-%{pg_ver}/lib/
 /opt/pgpro/ent-%{pg_ver}/share/extension
+%endif
+
+%if 0%{?is_opensuse}
+/usr/lib/postgresql%{pg_ver}/lib64
+/usr/share/postgresql%{pg_ver}/extension
 %endif
 
 %changelog

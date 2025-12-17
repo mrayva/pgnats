@@ -20,7 +20,6 @@ Requires:       postgresql%{pg_ver}-server
 BuildRequires:  postgresql%{pg_ver}-server-devel
 BuildRequires:  cargo-pgrx openssl clang
 Disttag:        mosos
-Distribution:   mosos/15.5/x86_64
 
 
 %description
