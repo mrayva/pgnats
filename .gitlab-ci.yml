@@ -105,7 +105,6 @@ buildRpm:
   stage: build
   image: ${HARBOR_HOST}/build/alse${ALSE_VER}:debBuild
   variables:
-    TRIVY_SFX: alse-${ALSE_VER}
     DEB_BUILD_OPTIONS: "noautodbgsym"
   before_script:
     - ln -s pkgBuild/ALSE${ALSE_VER} debian
@@ -152,7 +151,6 @@ buildRpm:
   stage: build
   image: ${HARBOR_HOST}/build/alse${ALSE_VER}:debBuild
   variables:
-    TRIVY_SFX: alse-${ALSE_VER}
     DEB_BUILD_OPTIONS: "noautodbgsym"
   before_script:
     - ln -s pkgBuild/ALSE${ALSE_VER}-certified debian
@@ -169,7 +167,6 @@ buildRpm:
     - sh /tmp/rustup.sh -y
     - echo "${GPG_ALSE}" | gpg --batch --import
     - echo "${GPG_ALSE_PASS}">GPG_PASS
-    - !reference [ .gen-trivy-scan-script, script ]
   script:
     - dch -m -v "${VERSION}~alse${ALSE_VER}" "All latest updates"
     - debuild -eVERSION -eCI -us -uc -b
@@ -180,10 +177,6 @@ buildRpm:
     name: pgsql-nats
     paths:
       - "*.deb"
-      - TRIVY-*.html
-    reports:
-      junit:
-        - TRIVY-*.xml
   parallel:
     matrix:
       - ALSE_VER:
