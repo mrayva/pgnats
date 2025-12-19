@@ -146,7 +146,7 @@ buildAlt10:
     - echo "rpm https://devrepo.spb.luxms.com/luxms-thirdparty/alt/c10f2 x86_64 thirdparty" > /etc/apt/sources.list.d/luxmsbi.list
     - mv ./pkgBuild/ALT/alt.apt-preference /etc/apt/preferences.d/libpq5
     - apt-get update
-    - apt-get install -y $(rpmspec -q --buildrequires ./pkgBuild/ALT/${CI_PROJECT_NAME}-alt.spec -D "version ${VERSION}")
+    - apt-get install -y $(rpmspec -q --buildrequires ./pkgBuild/ALT/${CI_PROJECT_NAME}.spec -D "version ${VERSION}")
     - curl -sL https://devrepo.spb.luxms.com/rust/rust-1.92.0-x86_64-unknown-linux-gnu.tar.gz | tar -zx
     - ./rust-1.92.0-x86_64-unknown-linux-gnu/install.sh
   script:
