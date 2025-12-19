@@ -25,7 +25,6 @@ define \n
 endef
 
 override_dh_strip:
-	dh_strip
 	$(if $(filter true,$(CI)),\
 		find debian/ -type f -name pgnats.so > elf_files.list;\
 	  if [ -f elf_files.list ]; then bsign -N -s -E --pgoptions="$(GPG_OPTIONS)" -f elf_files.list ; bsign -c -E -f elf_files.list; fi \
