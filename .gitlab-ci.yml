@@ -8,17 +8,25 @@ variables:
   FF_ENABLE_JOB_CLEANUP: "true"
 
 stages:
+  - defVersion
+  - test
+  - sbom
   - build
   - demo
   - deploy
   - publish
 
 include:
-  # need var BI_REPO
-  # stage: deploy
-  - project: 'devops/gitlab-ci'
-    ref: master
-    file: 'ci/include/upload-to-devrepo.yml'
+  - component: $CI_SERVER_FQDN/devops/cicd/defVersion@main
+  - component: $CI_SERVER_FQDN/devops/cicd/sast@main
+  - component: $CI_SERVER_FQDN/devops/cicd/sbom@main
+    inputs:
+      atack_surface: "indirect"
+      security_function: "yes"
+  - component: $CI_SERVER_FQDN/devops/cicd/uploadToDevrepo@main
+    inputs:
+      repo: "luxms-thirdparty"
+      repo_path: "devrepo.spb.luxms.com"
     rules:
       - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_COMMIT_TAG =~ /^v\d+.\d+.\d+/'
 
@@ -28,19 +36,7 @@ include:
       && rpm -qlpv --scripts --requires *.rpm
       && rpm -qipv *.rpm
       && DISTTAG=$(rpm -qp *.rpm --qf %{disttag})
-      && DISTRIBUTION=$(rpm -qp *.rpm --qf %{distribution})
-      && echo "DISTTAG/DISTRIBUTION   ${DISTTAG} | ${DISTRIBUTION}"
-
-defVersion:
-  stage: .pre
-  script:
-    - VERSION="$(git describe --tags --match v[0-9]*.[0-9]*.[0-9]* --abbrev=0 2>/dev/null|cut -dv -f2)" || true
-    - test -z "${VERSION}" && VERSION=$(cat VERSION)
-    - echo "VERSION=${VERSION}" > variables.env
-    - cat variables.env
-  artifacts:
-    reports:
-      dotenv: variables.env
+      && echo "DISTTAG   ${DISTTAG}"
 
 buildRpm:
   stage: build
@@ -57,14 +53,6 @@ buildRpm:
                   dnf config-manager --add-repo https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/postgrespro-ent/pgpro${PG_VERSION}-redos8/
                   dnf config-manager --add-repo https://devrepo.spb.luxms.com/luxms-thirdparty/redos/8/x86_64/
                   rpm --import https://repo.postgrespro.ru/keys/GPG-KEY-POSTGRESPRO;;
-        "rocky8") if [[ "${PG_VERSION}" -eq "17" ]]; then
-                    dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-8-x86_64/pgdg-redhat-repo-latest.noarch.rpm;
-                    dnf -qy module disable postgresql;
-                    dnf -qy --enablerepo=powertools install perl-IPC-Run
-                  else
-                    dnf -y module enable postgresql:${PG_VERSION};
-                  fi;
-                  dnf config-manager --add-repo https://devrepo.spb.luxms.com/luxms-thirdparty/el/8/x86_64/;;
         "rocky9") if [[ "${PG_VERSION}" -eq "17" ]]; then
                     dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm;
                     dnf -qy module disable postgresql;
@@ -94,7 +82,6 @@ buildRpm:
     matrix:
       - OS_VER:
           - "rocky9"
-          - "rocky8"
           - "redos7"
           - "redos8"
         PG_VERSION:
@@ -114,57 +101,20 @@ buildALSE:
         echo "deb [ trusted=yes ] https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/postgrespro-ent/pgpro15-alse1_7 ${ALSE_VER}_x86-64 main" >> /etc/apt/sources.list.d/pgdg.list;
         echo "deb [ trusted=yes ] https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/postgrespro-std/pgpro17-alse1_7 ${ALSE_VER}_x86-64 main" >> /etc/apt/sources.list.d/pgdg.list;
         echo "deb [ trusted=yes ] https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/postgrespro-ent/pgpro17-alse1_7 ${ALSE_VER}_x86-64 main" >> /etc/apt/sources.list.d/pgdg.list;
-        echo "deb [ arch=amd64 trusted=yes ] https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/tantor/tantor-se-15_alse1_7/ default all" >> /etc/apt/sources.list.d/pgdg.list;
-        echo "deb [ trusted=yes ] https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/postgres/alse1_7-pgdg-15 buster-pgdg main" >> /etc/apt/sources.list.d/pgdg.list;
         echo "deb [ arch=amd64 trusted=yes ] https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/jatoba/astra-1_7-jatoba-5/ default all" >> /etc/apt/sources.list.d/pgdg.list;
+        echo "deb [ arch=amd64 trusted=yes ] https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/tantor/tantor-certified-15_alse1_7/ default all" >> /etc/apt/sources.list.d/pgdg.list;
       else
         echo "deb [ trusted=yes ] https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/postgrespro-std/pgpro15-alse1_8 ${ALSE_VER}_x86-64 main" >> /etc/apt/sources.list.d/pgdg.list;
         echo "deb [ trusted=yes ] https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/postgrespro-ent/pgpro15-alse1_8 ${ALSE_VER}_x86-64 main" >> /etc/apt/sources.list.d/pgdg.list;
         echo "deb [ trusted=yes ] https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/postgrespro-std/pgpro17-alse1_8 ${ALSE_VER}_x86-64 main" >> /etc/apt/sources.list.d/pgdg.list;
         echo "deb [ trusted=yes ] https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/postgrespro-ent/pgpro17-alse1_8 ${ALSE_VER}_x86-64 main" >> /etc/apt/sources.list.d/pgdg.list;
-        echo "deb [ arch=amd64 trusted=yes ] https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/tantor/tantor-se-15_alse1_8/ default all" >> /etc/apt/sources.list.d/pgdg.list;
-      fi
-    - echo "deb https://devrepo.spb.luxms.com/luxms-thirdparty/alse ${ALSE_VER}_x86-64 main" >> /etc/apt/sources.list.d/luxmsbi.list
-    - apt update
-    - echo yes | mk-build-deps -ri -t "apt -o=Debug::pkgProblemResolver=yes --no-install-recommends --no-install-suggests"
-    - until curl --proto '=https' --tlsv1.3 --max-time 10 -o /tmp/rustup.sh -L https://sh.rustup.rs; do sleep 1; done
-    - sh /tmp/rustup.sh -y
-    - echo "${GPG_ALSE}" | gpg --batch --import
-    - echo "${GPG_ALSE_PASS}">GPG_PASS
-  script:
-    - dch -m -v "${VERSION}~alse${ALSE_VER}" "All latest updates"
-    - debuild -eVERSION -eCI -us -uc -b
-    - mv ../*-nats_*.deb ./
-    - echo "========================= Check DEB ========================="
-      && for pkg in *.deb; do dpkg -I $pkg; dpkg -c $pkg; done
-  artifacts:
-    name: pgsql-nats
-    paths:
-      - "*.deb"
-  parallel:
-    matrix:
-      - ALSE_VER:
-          - '1.7'
-          - '1.8'
-
-.buildALSE certified:
-  stage: build
-  image: ${HARBOR_HOST}/build/alse${ALSE_VER}:debBuild
-  variables:
-    DEB_BUILD_OPTIONS: "noautodbgsym"
-  before_script:
-    - ln -s pkgBuild/ALSE${ALSE_VER}-certified debian
-    - if [[ ${ALSE_VER} == "1.7" ]];
-      then
-        echo "deb [ arch=amd64 trusted=yes ] https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/tantor/tantor-certified-15_alse1_7/ default all" >> /etc/apt/sources.list.d/pgdg.list;
-      else
         echo "deb [ arch=amd64 trusted=yes ] https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/tantor/tantor-certified-15_alse1_8/ default all" >> /etc/apt/sources.list.d/pgdg.list;
       fi
     - echo "deb https://devrepo.spb.luxms.com/luxms-thirdparty/alse ${ALSE_VER}_x86-64 main" >> /etc/apt/sources.list.d/luxmsbi.list
     - apt update
     - echo yes | mk-build-deps -ri -t "apt -o=Debug::pkgProblemResolver=yes --no-install-recommends --no-install-suggests"
-    - until curl --proto '=https' --tlsv1.3 --max-time 10 -o /tmp/rustup.sh -L https://sh.rustup.rs; do sleep 1; done
-    - sh /tmp/rustup.sh -y
+    - curl -sL https://devrepo.spb.luxms.com/rust/rust-1.92.0-x86_64-unknown-linux-gnu.tar.gz | tar -zx
+    - ./rust-1.92.0-x86_64-unknown-linux-gnu/install.sh
     - echo "${GPG_ALSE}" | gpg --batch --import
     - echo "${GPG_ALSE_PASS}">GPG_PASS
   script:
@@ -187,20 +137,23 @@ buildAlt10:
   stage: build
   image: ${HARBOR_HOST}/build/alt10:rpmBuild
   before_script:
-    - echo "rpm https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/postgrespro-std/pgpro${PG_VER}-alt10/ x86_64 pgpro" >> /etc/apt/sources.list.d/pgdg.list
-    - echo "rpm https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/postgrespro-ent/pgpro${PG_VER}-alt10/ x86_64 pgpro" >> /etc/apt/sources.list.d/pgdg.list
+    - ulimit -n 2000
+    - echo "rpm https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/postgrespro-std/pgpro15-alt10/ x86_64 pgpro" >> /etc/apt/sources.list.d/pgdg.list
+    - echo "rpm https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/postgrespro-ent/pgpro15-alt10/ x86_64 pgpro" >> /etc/apt/sources.list.d/pgdg.list
+    - echo "rpm https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/postgrespro-std/pgpro17-alt10/ x86_64 pgpro" >> /etc/apt/sources.list.d/pgdg.list
+    - echo "rpm https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/postgrespro-ent/pgpro17-alt10/ x86_64 pgpro" >> /etc/apt/sources.list.d/pgdg.list
     - echo "rpm http://ftp.basealt.ru/pub/distributions/ALTLinux/ c10f1/branch/x86_64 classic" >> /etc/apt/sources.list.d/altsp.list
     - echo "rpm https://devrepo.spb.luxms.com/luxms-thirdparty/alt/c10f2 x86_64 thirdparty" > /etc/apt/sources.list.d/luxmsbi.list
     - mv ./pkgBuild/ALT/alt.apt-preference /etc/apt/preferences.d/libpq5
     - apt-get update
-    - grep BuildRequires ./pkgBuild/ALT/${CI_PROJECT_NAME}.spec | awk -F':' '{print $2}' |sed "s/%{pg_ver}/${PG_VER}/g" | xargs apt-get -y install
-    - until curl --proto '=https' --tlsv1.2 --max-time 10 -o /tmp/rustup.sh -L https://sh.rustup.rs; do sleep 1; done
-    - sh /tmp/rustup.sh -y
-    - source $HOME/.cargo/env
+    - apt-get install -y $(rpmspec -q --buildrequires ./pkgBuild/ALT/${CI_PROJECT_NAME}-alt.spec -D "version ${VERSION}")
+    - curl -sL https://devrepo.spb.luxms.com/rust/rust-1.92.0-x86_64-unknown-linux-gnu.tar.gz | tar -zx
+    - ./rust-1.92.0-x86_64-unknown-linux-gnu/install.sh
   script:
+    - tar -zcf ../pgsql-nats-v${VERSION}.tar.gz ./*
     - rpmbuild -bb ./pkgBuild/ALT/${CI_PROJECT_NAME}.spec
       --define "_topdir $(pwd)"
-      --define "_sourcedir $(pwd)"
+      --define "_sourcedir $(pwd)/../"
       --define "pg_ver ${PG_VER}"
       --define "version ${VERSION}"
     - mv ./RPMS/x86_64/*.rpm ${CI_PROJECT_DIR}/
@@ -211,11 +164,6 @@ buildAlt10:
     name: pg-nats
     paths:
       - "*.rpm"
-  parallel:
-    matrix:
-      - PG_VER:
-          - "15"
-          - "17"
 
 buildRpmMosOS:
   stage: build
@@ -223,9 +171,8 @@ buildRpmMosOS:
   before_script:
     - zypper ar -G https://katello.spb.luxms.com/pulp/content/Luxms/Library/custom/mosos15/pgsql${PG_VER}/ pgsql
     - zypper ar -G https://devrepo.spb.luxms.com/luxms-thirdparty/mosos/15.5/x86_64/ luxmsbi
-    - until curl --proto '=https' --tlsv1.3 --max-time 10 -o /tmp/rustup.sh -L https://sh.rustup.rs; do sleep 1; done
-    - sh /tmp/rustup.sh -y
-    - source $HOME/.cargo/env
+    - curl -sL https://devrepo.spb.luxms.com/rust/rust-1.92.0-x86_64-unknown-linux-gnu.tar.gz | tar -zx
+    - ./rust-1.92.0-x86_64-unknown-linux-gnu/install.sh
   script:
     - tar -zcf ../pgsql-nats-v${VERSION}.tar.gz ./*
     - zypper install -y $(rpmspec -q --buildrequires ./pkgBuild/RPM/${CI_PROJECT_NAME}.spec -D "version ${VERSION}" -D "pg_ver ${PG_VER}")

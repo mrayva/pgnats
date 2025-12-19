@@ -1,16 +1,15 @@
 #!/usr/bin/make -f
 export DH_VERBOSE = 1
+export PATH := /usr/local/bin:$(PATH)
 
 GPG_OPTIONS := --batch --pinentry-mode loopback --passphrase-file GPG_PASS --default-key=08C82543B30BE336
 
-PGCONFIG_pgsql15-nats := /usr/lib/postgresql/15/bin/pg_config
-PGVER_pgsql15-nats := 15
 PGCONFIG_pgpro15-nats := /opt/pgpro/std-15/bin/pg_config
 PGVER_pgpro15-nats := 15
 PGCONFIG_pgpro15ent-nats := /opt/pgpro/ent-15/bin/pg_config
 PGVER_pgpro15ent-nats := 15
-PGCONFIG_tantor15se-nats := /opt/tantor/db/15/bin/pg_config
-PGVER_tantor15se-nats := 15
+PGCONFIG_tantor15certified-nats := /opt/tantor/db/15/bin/pg_config
+PGVER_tantor15certified-nats := 15
 PGCONFIG_jatoba5-nats := /usr/jatoba-5/bin/pg_config
 PGVER_jatoba5-nats := 15
 PGCONFIG_pgpro17-nats := /opt/pgpro/std-17/bin/pg_config
@@ -34,8 +33,8 @@ override_dh_strip:
 
 override_dh_auto_install:
 	$(foreach pkg,$(PKG_LIST), \
-		/root/.cargo/bin/cargo pgrx init --pg$(PGVER_$(pkg)) $(PGCONFIG_$(pkg)) \
-		&& /root/.cargo/bin/cargo pgrx package --features xid8 --pg-config $(PGCONFIG_$(pkg)) \
+		cargo pgrx init --pg$(PGVER_$(pkg)) $(PGCONFIG_$(pkg)) \
+		&& cargo pgrx package --features xid8 --pg-config $(PGCONFIG_$(pkg)) \
 		&& mv target/release/pgnats-pg$(PGVER_$(pkg)) debian/$(pkg) \
 		${\n} \
 	)

@@ -2,18 +2,13 @@ Source: pgsql-nats
 Section: database
 Priority: optional
 Maintainer: Luxms Package Manager <repo@luxms.com>
-Build-Depends: debhelper (>= 12), curl, unzip, cargo-pgrx, postgresql-server-dev-15, postgrespro-std-15-dev, postgrespro-ent-15-dev, postgrespro-std-17-dev, postgrespro-ent-17-dev, tantor-se-server-15, jatoba5-dev, jatoba5-client
+Build-Depends: debhelper (>= 12), curl, unzip, cargo-pgrx, postgrespro-std-15-dev, postgrespro-ent-15-dev, postgrespro-std-17-dev, postgrespro-ent-17-dev, jatoba5-dev, jatoba5-client, tantor-certified-server-15, clang
 Standards-Version: 10.0.0
 Homepage: https://github.com/luxms/pgnats/
 
 Package: jatoba5-nats
 Architecture: amd64
 Depends: ${shlibs:Depends}, jatoba5-server
-Description: NATS connect for PostgreSQL.
-
-Package: pgsql15-nats
-Architecture: amd64
-Depends: ${shlibs:Depends}, postgresql-15
 Description: NATS connect for PostgreSQL.
 
 Package: pgpro15-nats
@@ -27,9 +22,9 @@ Depends: ${shlibs:Depends}, postgrespro-ent-15-server
 Provides: pgpro15-nats (= ${binary:Version})
 Description: NATS connect for PostgreSQL.
 
-Package: tantor15se-nats
+Package: tantor15certified-nats
 Architecture: amd64
-Depends: ${shlibs:Depends}, tantor-se-server-15
+Depends: ${shlibs:Depends}, tantor-certified-server-15
 PROVIDES: tantor15-nats (= ${binary:Version})
 Description: NATS connect for PostgreSQL.
 
