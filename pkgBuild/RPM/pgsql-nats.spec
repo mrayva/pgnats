@@ -19,11 +19,10 @@ Vendor:         YASP Ltd, Luxms Group
 URL:            https://github.com/luxms/pgnats
 License:        CorpGPL
 SOURCE0:		pgsql-nats-v%{version}.tar.gz
-
-Requires:       postgresql%{pg_ver}-server
 BuildRequires:  cargo-pgrx openssl clang
 
 %if 0%{?redos}
+Requires:       postgresql%{pg_ver}-server
 BuildRequires:  rust rustfmt cargo postgresql%{pg_ver}-devel
 Disttag:        redos%{redos_ver}
 %endif
@@ -33,6 +32,7 @@ Disttag:        redos%{redos_ver}
 Requires:       postgresql-server >= %{pg_ver} postgresql-server < %(echo $((%{pg_ver} + 1)))
 BuildRequires:  postgresql-server-devel >= %{pg_ver} postgresql-server-devel < %(echo $((%{pg_ver} + 1)))
 %else
+Requires:       postgresql%{pg_ver}-server
 BuildRequires:  postgresql%{pg_ver}-devel
 %endif
 BuildRequires:  rust rustfmt cargo
@@ -40,6 +40,7 @@ Disttag:        el%{rhel}
 %endif
 
 %if 0%{?is_opensuse}
+Requires:       postgresql%{pg_ver}-server
 BuildRequires:  postgresql%{pg_ver}-server-devel
 Disttag:        mosos
 %endif
