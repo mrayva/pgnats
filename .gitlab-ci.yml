@@ -90,7 +90,7 @@ buildRpm:
 
 buildALSE:
   stage: build
-  image: ${HARBOR_HOST}/build/alse${ALSE_VER}:debBuild
+  image: ${HARBOR_HOST}/build/alse${ALSE_VER}:debBuild1225
   variables:
     DEB_BUILD_OPTIONS: "noautodbgsym"
   before_script:
