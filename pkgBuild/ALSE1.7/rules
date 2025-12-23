@@ -2,7 +2,7 @@
 export DH_VERBOSE = 1
 export PATH := /usr/local/bin:$(PATH)
 
-GPG_OPTIONS := --batch --pinentry-mode loopback --passphrase-file GPG_PASS --default-key=08C82543B30BE336
+GPG_OPTIONS := --batch --pinentry-mode loopback --passphrase-file $(CURDIR)/GPG_PASS --default-key=08C82543B30BE336
 
 PGCONFIG_pgpro15-nats := /opt/pgpro/std-15/bin/pg_config
 PGVER_pgpro15-nats := 15
