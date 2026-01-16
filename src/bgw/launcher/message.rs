@@ -1,15 +1,15 @@
-use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 
-#[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ExtensionStatus {
     Exist,
     NoExtension,
     NoForeignServer,
 }
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum LauncherMessage {
     DbExtensionStatus {
         db_oid: u32,

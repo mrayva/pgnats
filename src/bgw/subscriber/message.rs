@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 
-#[derive(Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 pub enum SubscriberMessage {
     NewConfig {
         config: Config,
