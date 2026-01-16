@@ -4,10 +4,10 @@ use pgrx::pg_sys as sys;
 
 use crate::{
     bgw::{
-        DSM_SIZE,
         launcher::worker_entry::{RunningState, TerminatedState, WorkerEntry},
         pgrx_wrappers::shm_mq::ShmMqSender,
         subscriber::message::SubscriberMessage,
+        DSM_SIZE,
     },
     config::Config,
 };
@@ -156,7 +156,6 @@ impl LauncherContext {
 }
 
 fn send_subscriber_message(sender: &mut ShmMqSender, msg: SubscriberMessage) -> anyhow::Result<()> {
-    let data = bincode::encode_to_vec(msg, bincode::config::standard())?;
-
+    let data = postcard::to_stdvec(&msg)?;
     sender.send(&data)
 }

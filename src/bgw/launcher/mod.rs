@@ -5,20 +5,19 @@ pub mod message;
 pub mod pg_api;
 
 use pgrx::{
-    PgLwLock,
     bgworkers::{BackgroundWorker, SignalWakeFlags},
-    pg_sys as sys,
+    pg_sys as sys, PgLwLock,
 };
 
 use crate::{
     bgw::{
-        LAUNCHER_MESSAGE_BUS, SUBSCRIBER_ENTRY_POINT,
         launcher::{
             context::LauncherContext,
             message::{ExtensionStatus, LauncherMessage},
             pg_api::fetch_database_oids,
         },
         ring_queue::RingQueue,
+        LAUNCHER_MESSAGE_BUS, SUBSCRIBER_ENTRY_POINT,
     },
     constants::{EXTENSION_NAME, FDW_EXTENSION_NAME},
     debug, log, warn,
@@ -80,11 +79,10 @@ pub fn process_launcher_bus<const N: usize>(
     let mut guard = queue.exclusive();
 
     while let Some(buf) = guard.try_recv() {
-        let parse_result: Result<(LauncherMessage, _), _> =
-            bincode::decode_from_slice(&buf[..], bincode::config::standard());
+        let parse_result: Result<LauncherMessage, _> = postcard::from_bytes(&buf[..]);
 
         let msg = match parse_result {
-            Ok((msg, _)) => msg,
+            Ok(msg) => msg,
             Err(err) => {
                 warn!("Failed to decode launcher message: {}", err);
                 continue;
@@ -222,7 +220,7 @@ pub fn send_message_to_launcher<const N: usize>(
     bus: &PgLwLock<RingQueue<N>>,
     msg: LauncherMessage,
 ) -> anyhow::Result<()> {
-    let data = bincode::encode_to_vec(msg, bincode::config::standard())?;
+    let data = postcard::to_stdvec(&msg)?;
 
     bus.exclusive()
         .try_send(&data)
@@ -237,7 +235,7 @@ pub fn send_message_to_launcher_with_retry<const N: usize>(
     tries: usize,
     interval: std::time::Duration,
 ) -> anyhow::Result<()> {
-    let data = bincode::encode_to_vec(msg, bincode::config::standard())?;
+    let data = postcard::to_stdvec(&msg)?;
     let mut n = 0;
 
     while n < tries {

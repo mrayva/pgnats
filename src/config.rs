@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashMap, path::PathBuf};
+use std::{borrow::Cow, collections::HashMap};
 
 use pgrx::{PgTryBuilder, Spi};
 
@@ -7,20 +7,20 @@ use crate::constants::{
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "sub", derive(bincode::Encode, bincode::Decode))]
+#[cfg_attr(feature = "sub", derive(serde::Serialize, serde::Deserialize))]
 pub enum NatsTlsOptions {
     Tls {
-        ca: PathBuf,
+        ca: String,
     },
     MutualTls {
-        ca: PathBuf,
-        cert: PathBuf,
-        key: PathBuf,
+        ca: String,
+        cert: String,
+        key: String,
     },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "sub", derive(bincode::Encode, bincode::Decode))]
+#[cfg_attr(feature = "sub", derive(serde::Serialize, serde::Deserialize))]
 pub struct NatsConnectionOptions {
     pub host: String,
     pub port: u16,
@@ -29,7 +29,7 @@ pub struct NatsConnectionOptions {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "sub", derive(bincode::Encode, bincode::Decode))]
+#[cfg_attr(feature = "sub", derive(serde::Serialize, serde::Deserialize))]
 pub struct Config {
     pub nats_opt: NatsConnectionOptions,
     pub notify_subject: String,
@@ -37,8 +37,6 @@ pub struct Config {
 }
 
 pub fn fetch_config(fdw_extension_name: &str) -> Config {
-    use std::str::FromStr;
-
     let mut options = HashMap::new();
 
     let Some(fdw_server_name) = fetch_fdw_server_name(fdw_extension_name) else {
@@ -46,7 +44,7 @@ pub fn fetch_config(fdw_extension_name: &str) -> Config {
         return parse_config(&options);
     };
 
-    let Ok(fdw_server_name) = std::ffi::CString::from_str(&fdw_server_name) else {
+    let Ok(fdw_server_name) = std::ffi::CString::new(fdw_server_name) else {
         crate::warn!("Failed to parse FDW server name");
         return parse_config(&options);
     };
@@ -115,13 +113,11 @@ pub fn parse_config(options: &HashMap<Cow<'_, str>, Cow<'_, str>>) -> Config {
 
         match (tls_cert_part, tls_key_path) {
             (Some(cert), Some(key)) => Some(NatsTlsOptions::MutualTls {
-                ca: PathBuf::from(ca.as_ref()),
-                cert: PathBuf::from(cert.as_ref()),
-                key: PathBuf::from(key.as_ref()),
+                ca: ca.to_string(),
+                cert: cert.to_string(),
+                key: key.to_string(),
             }),
-            _ => Some(NatsTlsOptions::Tls {
-                ca: PathBuf::from(ca.as_ref()),
-            }),
+            _ => Some(NatsTlsOptions::Tls { ca: ca.to_string() }),
         }
     } else {
         None

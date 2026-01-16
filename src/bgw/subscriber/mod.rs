@@ -5,19 +5,17 @@ pub mod message;
 pub mod pg_api;
 
 use std::sync::{
+    mpsc::{channel, Sender},
     Arc,
-    mpsc::{Sender, channel},
 };
 
 use pgrx::{
-    FromDatum, PgLwLock,
     bgworkers::{BackgroundWorker, SignalWakeFlags},
-    pg_sys as sys,
+    pg_sys as sys, FromDatum, PgLwLock,
 };
 
 use crate::{
     bgw::{
-        LAUNCHER_MESSAGE_BUS, SUBSCRIPTIONS_TABLE_NAME,
         launcher::{
             message::{ExtensionStatus, LauncherMessage},
             send_message_to_launcher,
@@ -33,6 +31,7 @@ use crate::{
             nats::NatsConnectionState,
             pg_api::{call_function, delete_subject_callback, insert_subject_callback},
         },
+        LAUNCHER_MESSAGE_BUS, SUBSCRIPTIONS_TABLE_NAME,
     },
     config::{fetch_config, fetch_fdw_server_name},
     constants::{EXTENSION_NAME, FDW_EXTENSION_NAME},
@@ -222,10 +221,9 @@ fn handle_message_from_shared_queue(
     ctx: &mut SubscriberContext,
     db_name: &str,
 ) {
-    let parse_result: Result<(SubscriberMessage, _), _> =
-        bincode::decode_from_slice(buf, bincode::config::standard());
+    let parse_result: Result<SubscriberMessage, _> = postcard::from_bytes(buf);
     let msg = match parse_result {
-        Ok((msg, _)) => msg,
+        Ok(msg) => msg,
         Err(err) => {
             warn!(
                 context = db_name,
