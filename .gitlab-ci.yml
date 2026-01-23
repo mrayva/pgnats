@@ -41,7 +41,7 @@ include:
 linter:
   stage: test
   script:
-    - dnf install cargo clippy
+    - dnf -y install cargo clippy
     - cargo clippy -- -D warnings
 
 buildRpm:
