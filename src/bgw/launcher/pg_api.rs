@@ -3,6 +3,11 @@ use std::ptr::null_mut;
 use pgrx::pg_sys as sys;
 
 pub fn fetch_database_oids() -> Vec<sys::Oid> {
+    // SAFETY:
+    // 1. Relation is opened with AccessShareLock before scanning.
+    // 2. Scan lifecycle strictly follows Postgres API contract:
+    //    table_open -> table_beginscan_catalog -> heap_getnext* -> table_endscan -> table_close.
+    // 3. Returned tuples remain valid until the scan is finished.
     unsafe {
         let mut workers = vec![];
 

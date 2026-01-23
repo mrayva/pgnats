@@ -49,6 +49,12 @@ pub fn fetch_config(fdw_extension_name: &str) -> Config {
         return parse_config(&options);
     };
 
+    // SAFETY:
+    //
+    // 1. We pass a correct arguments to `GetForeignServerByName` and check if the result is null.
+    // 2. We ensure that the `options_list` is not null before iterating over it.
+    // 3. We ensure that the `defname` and `arg` fields are not null before accessing them.
+    // 4. Node casting is safe according to Postgres documentation
     unsafe {
         let server = pgrx::pg_sys::GetForeignServerByName(fdw_server_name.as_ptr(), true);
 
@@ -61,27 +67,35 @@ pub fn fetch_config(fdw_extension_name: &str) -> Config {
             let list: pgrx::PgList<pgrx::pg_sys::DefElem> = pgrx::PgList::from_pg(options_list);
 
             for def_elem in list.iter_ptr() {
+                if def_elem.is_null() || (*def_elem).defname.is_null() {
+                    continue;
+                }
+
                 let key = std::ffi::CStr::from_ptr((*def_elem).defname)
                     .to_string_lossy()
                     .to_string();
 
-                let value = if !(*def_elem).arg.is_null() {
-                    let node = (*def_elem).arg;
-
-                    if (*node).type_ == pgrx::pg_sys::NodeTag::T_String {
-                        #[cfg(any(feature = "pg13", feature = "pg14"))]
-                        let val = (*(node as *mut pgrx::pg_sys::Value)).val.str_;
-
-                        #[cfg(not(any(feature = "pg13", feature = "pg14")))]
-                        let val = (*(node as *mut pgrx::pg_sys::String)).sval;
-
-                        std::ffi::CStr::from_ptr(val).to_string_lossy().to_string()
-                    } else {
-                        continue;
-                    }
-                } else {
+                if (*def_elem).arg.is_null() {
                     continue;
-                };
+                }
+
+                let node = (*def_elem).arg;
+
+                if (*node).type_ != pgrx::pg_sys::NodeTag::T_String {
+                    continue;
+                }
+
+                #[cfg(any(feature = "pg13", feature = "pg14"))]
+                let val = (*(node as *mut pgrx::pg_sys::Value)).val.str_;
+
+                #[cfg(not(any(feature = "pg13", feature = "pg14")))]
+                let val = (*(node as *mut pgrx::pg_sys::String)).sval;
+
+                if val.is_null() {
+                    continue;
+                }
+
+                let value = std::ffi::CStr::from_ptr(val).to_string_lossy().to_string();
 
                 let _ = options.insert(key.into(), value.into());
             }

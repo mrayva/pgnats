@@ -33,7 +33,7 @@ sub = ["postcard", "reqwest"]
 anyhow = { version = "1.0", default-features = false }
 async-nats = { version = "0.45.0" }
 futures = "0.3.31"
-paste = "1.0.15"
+pastey = "0.2.1"
 pgrx = { git = "https://github.com/luxms/pgrx", version = "0.15.0", features = [
     "unsafe-postgres",
 ] }
@@ -42,7 +42,7 @@ serde_json = "1.0.138"
 tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
 
-postcard = { optional = true, version = "1.0.0", features = ["use-std"] }
+postcard = { optional = true, version = "1.0.0", default-features = false, features = ["use-std"] }
 reqwest = { optional = true, version = "0.12.22", default-features = false, features = [
     "json",
     "blocking",
@@ -57,6 +57,7 @@ warp = { optional = true, version = "0.3.7", default-features = false }
 pgrx-tests = { git = "https://github.com/luxms/pgrx", version = "0.15.0" }
 
 [build-dependencies]
+anyhow = { version = "1.0", default-features = false }
 cargo_toml = "0.21.0"
 shadow-rs = "=0.38.1"
 
@@ -68,3 +69,30 @@ panic = "unwind"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+[lints.rust]
+warnings = 'deny'
+unused_extern_crates = 'warn'
+trivial_numeric_casts = 'warn'
+unstable_features = 'warn'
+unused_import_braces = 'warn'
+unused-lifetimes = 'warn'
+unused-macro-rules = 'warn'
+
+[lints.clippy]
+unwrap_used = 'deny'
+expect_used = 'deny'
+panic = 'deny'
+indexing_slicing = 'deny'
+dbg_macro = 'deny'
+join_absolute_paths = 'deny'
+needless_collect = 'deny'
+option_env_unwrap = 'deny'
+panicking_unwrap = 'deny'
+serde_api_misuse = 'deny'
+transmute_ptr_to_ref = 'deny'
+transmute_undefined_repr = 'deny'
+trivially_copy_pass_by_ref = 'deny'
+uninit_vec = 'deny'
+unnecessary_box_returns = 'deny'
+undocumented_unsafe_blocks = 'deny'
