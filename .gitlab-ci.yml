@@ -38,6 +38,12 @@ include:
       && DISTTAG=$(rpm -qp *.rpm --qf %{disttag})
       && echo "DISTTAG   ${DISTTAG}"
 
+linter:
+  stage: test
+  script:
+    - dnf install cargo clippy
+    - cargo clippy -- -D warnings
+
 buildRpm:
   stage: build
   image: ${HARBOR_HOST}/build/${OS_VER}:rpmBuild
