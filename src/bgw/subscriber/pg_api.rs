@@ -14,6 +14,9 @@ pub enum CallError {
 }
 
 pub fn fetch_status() -> PgInstanceStatus {
+    // SAFETY: Calling Postgres backend function which takes no arguments,
+    // has no side effects, and does not rely on any Rust-managed memory.
+    // Safe as long as we are running inside a valid Postgres backend process.
     if unsafe { pgrx::pg_sys::RecoveryInProgress() } {
         PgInstanceStatus::Replica
     } else {

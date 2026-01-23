@@ -35,7 +35,7 @@ use crate::{
     },
     config::{fetch_config, fetch_fdw_server_name},
     constants::{EXTENSION_NAME, FDW_EXTENSION_NAME},
-    debug, log,
+    debug, error, log,
     utils::{get_database_name, is_extension_installed, unpack_i64_to_oid_dsmh},
     warn,
 };
@@ -43,9 +43,14 @@ use crate::{
 #[pgrx::pg_guard]
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn background_worker_subscriber_entry_point(arg: sys::Datum) {
-    let arg = unsafe {
-        i64::from_polymorphic_datum(arg, false, sys::INT8OID)
-            .expect("Subscriber: failed to extract i64 argument from Datum")
+    // SAFETY:
+    // Postgres guarantees that `arg` is passed exactly as registered
+    // when the background worker was started, and here it is always
+    // an INT8 datum.
+    let arg = unsafe { i64::from_polymorphic_datum(arg, false, sys::INT8OID) };
+    let Some(arg) = arg else {
+        error!("Subscriber: failed to extract i64 argument from Datum");
+        return;
     };
 
     let (db_oid, dsmh) = unpack_i64_to_oid_dsmh(arg);
@@ -73,6 +78,9 @@ pub fn background_worker_subscriber_main<const N: usize>(
 ) -> anyhow::Result<()> {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
+    // SAFETY:
+    // Must be called from a background worker process before any SPI usage.
+    // `db_oid` refers to an existing database.
     unsafe {
         sys::BackgroundWorkerInitializeConnectionByOid(db_oid, sys::InvalidOid, 0);
     }

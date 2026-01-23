@@ -10,6 +10,9 @@ pub extern "C-unwind" fn _PG_init() {
     #[cfg(any(test, feature = "pg_test"))]
     crate::pg_tests::bgw_tests::init_test_shared_memory();
 
+    // SAFETY:
+    // Registers a process-exit callback. Function pointer has static lifetime
+    // and does not capture Rust-managed state.
     unsafe {
         pg_sys::on_proc_exit(Some(extension_exit_callback), pg_sys::Datum::from(0));
     }

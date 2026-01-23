@@ -34,6 +34,8 @@ impl<const CAPACITY: usize> Default for RingQueue<CAPACITY> {
 
 impl<const CAPACITY: usize> RingQueue<CAPACITY> {
     #[allow(clippy::result_unit_err)]
+    // Implementation must be well-tested
+    #[allow(clippy::indexing_slicing)]
     pub fn try_send(&mut self, msg: &[u8]) -> Result<(), ()> {
         if self.is_full {
             return Err(());
@@ -104,6 +106,8 @@ impl<const CAPACITY: usize> RingQueue<CAPACITY> {
         Ok(())
     }
 
+    // Implementation must be well-tested
+    #[allow(clippy::indexing_slicing)]
     pub fn try_recv(&mut self) -> Option<Vec<u8>> {
         let read = self.read;
         let write = self.write;
@@ -169,6 +173,10 @@ impl<const CAPACITY: usize> RingQueue<CAPACITY> {
     }
 }
 
+// SAFETY:
+// `RingQueue` contains only plain data (no pointers, references, or Drop types),
+// has a stable memory layout, and does not rely on Rust-managed ownership,
+// making it safe to place inside Postgres shared memory.
 unsafe impl<const CAPACITY: usize> PGRXSharedMemory for RingQueue<CAPACITY> {}
 
 #[cfg(test)]

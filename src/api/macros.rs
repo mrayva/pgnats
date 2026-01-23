@@ -2,7 +2,7 @@
 #[doc(hidden)]
 macro_rules! impl_nats_publish {
     ($(#[$attr:meta])* $suffix:ident, $ty:ty) => {
-        paste::paste! {
+        pastey::paste! {
             #[pgrx::pg_extern]
             $(#[$attr])*
             pub fn [<nats_publish_ $suffix>](subject: &str, payload: $ty, reply: ::pgrx::default!(Option<&str>, "NULL"), headers: ::pgrx::default!(Option<pgrx::JsonB>, "NULL")) -> anyhow::Result<()> {
@@ -34,7 +34,7 @@ macro_rules! impl_nats_publish {
 #[doc(hidden)]
 macro_rules! impl_nats_request {
     ($(#[$attr:meta])* $suffix:ident, $ty:ty) => {
-        paste::paste! {
+        pastey::paste! {
             #[pgrx::pg_extern]
             $(#[$attr])*
                 pub fn [<nats_request_ $suffix>](subject: &str, payload: $ty, timeout: Option<i32>) -> anyhow::Result<Vec<u8>> {
@@ -51,7 +51,7 @@ macro_rules! impl_nats_request {
 #[doc(hidden)]
 macro_rules! impl_nats_put {
     ($(#[$attr:meta])* $suffix:ident, $ty:ty) => {
-        paste::paste! {
+        pastey::paste! {
             #[pgrx::pg_extern]
             $(#[$attr])*
                 pub fn [<nats_put_ $suffix>](bucket: String, key: &str, data: $ty) -> anyhow::Result<i64> {
@@ -69,7 +69,7 @@ macro_rules! impl_nats_put {
 #[doc(hidden)]
 macro_rules! impl_nats_get {
     ($(#[$attr:meta])* $suffix:ident, $ret:ty) => {
-        paste::paste! {
+        pastey::paste! {
             #[pgrx::pg_extern]
             $(#[$attr])*
             pub fn [<nats_get_ $suffix>](bucket: String, key: &str) -> anyhow::Result<Option<$ret>> {

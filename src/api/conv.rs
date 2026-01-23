@@ -24,8 +24,8 @@ pub fn map_server_info(
         name!(lame_duck_mode, bool),
     ),
 > {
-    pgrx::iter::TableIterator::new(v.into_iter().map(|v| {
-        (
+    pgrx::iter::TableIterator::new(v.into_iter().filter_map(|v| {
+        Some((
             v.server_id,
             v.server_name,
             v.host,
@@ -38,11 +38,11 @@ pub fn map_server_info(
             v.client_id as _,
             v.go,
             v.nonce,
-            pgrx::JsonB(serde_json::to_value(v.connect_urls).expect("Must generate value")),
+            pgrx::JsonB(serde_json::to_value(v.connect_urls).ok()?),
             v.client_ip,
             v.headers,
             v.lame_duck_mode,
-        )
+        ))
     }))
 }
 
@@ -67,19 +67,15 @@ pub fn map_object_info(
         name!(delete, bool),
     ),
 > {
-    pgrx::iter::TableIterator::new(v.into_iter().map(|v| {
-        (
+    pgrx::iter::TableIterator::new(v.into_iter().filter_map(|v| {
+        Some((
             v.name,
             v.description,
-            pgrx::JsonB(serde_json::to_value(v.metadata).expect("Must generate value from meta")),
-            v.headers.map(|headers| {
-                pgrx::JsonB(
-                    serde_json::to_value(headers).expect("Must generate value from headers"),
-                )
-            }),
-            v.options.map(|opt| {
-                pgrx::JsonB(serde_json::to_value(opt).expect("Must generate value from options"))
-            }),
+            pgrx::JsonB(serde_json::to_value(v.metadata).ok()?),
+            v.headers
+                .and_then(|headers| Some(pgrx::JsonB(serde_json::to_value(headers).ok()?))),
+            v.options
+                .and_then(|opt| Some(pgrx::JsonB(serde_json::to_value(opt).ok()?))),
             v.bucket,
             v.nuid,
             v.size as i64,
@@ -87,6 +83,6 @@ pub fn map_object_info(
             v.modified.map(|v| v.to_string()),
             v.digest,
             v.deleted,
-        )
+        ))
     }))
 }

@@ -1,10 +1,9 @@
 use pgrx::{
-    IntoDatum,
     bgworkers::{
         BackgroundWorker, BackgroundWorkerBuilder, BgWorkerStartTime, DynamicBackgroundWorker,
         TerminatingDynamicBackgroundWorker,
     },
-    pg_sys as sys,
+    pg_sys as sys, IntoDatum,
 };
 
 use crate::{
@@ -37,6 +36,9 @@ impl WorkerEntry<RunningState> {
         let db_name = BackgroundWorker::transaction(|| get_database_name(oid))
             .ok_or_else(|| anyhow::anyhow!("Failed to resolve database name for OID {oid}."))?;
 
+        // SAFETY: `shm_mq_minimum_size` is a Postgres backend global which is initialized
+        // before extension code is executed. Postgres backends are single-threaded,
+        // and this variable is immutable after initialization.
         let size = shm_size.min(unsafe { sys::shm_mq_minimum_size });
         let dsm = DynamicSharedMemory::new(size + APPROX_SHM_HEADER_SIZE)
             .map_err(|e| {
@@ -55,6 +57,9 @@ impl WorkerEntry<RunningState> {
             )
         })?;
 
+        // SAFETY: `MyProcPid` is a Postgres backend global which is initialized
+        // before extension code is executed. Postgres backends are single-threaded,
+        // and this variable is immutable after initialization.
         let worker = BackgroundWorkerBuilder::new(name)
             .set_type(ty)
             .enable_spi_access()

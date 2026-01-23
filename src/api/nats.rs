@@ -566,6 +566,9 @@ pub fn nats_get_file_list(
 #[pg_extern]
 #[cfg(feature = "sub")]
 pub fn nats_subscribe(subject: String, fn_oid: pg_sys::Oid) -> anyhow::Result<()> {
+    // SAFETY: Calling Postgres backend function which takes no arguments,
+    // has no side effects, and does not rely on any Rust-managed memory.
+    // Safe as long as we are running inside a valid Postgres backend process.
     if unsafe { pgrx::pg_sys::RecoveryInProgress() } {
         anyhow::bail!("Subscriptions are not allowed in replica mode");
     }
@@ -576,6 +579,9 @@ pub fn nats_subscribe(subject: String, fn_oid: pg_sys::Oid) -> anyhow::Result<()
     crate::bgw::launcher::send_message_to_launcher_with_retry(
         &crate::bgw::LAUNCHER_MESSAGE_BUS,
         crate::bgw::launcher::message::LauncherMessage::Subscribe {
+            // SAFETY: `MyDatabaseId` is a Postgres backend global which is initialized
+            // before extension code is executed. Postgres backends are single-threaded,
+            // and this variable is immutable after initialization.
             db_oid: unsafe { pgrx::pg_sys::MyDatabaseId }.to_u32(),
             subject,
             fn_name,
@@ -604,6 +610,9 @@ pub fn nats_subscribe(subject: String, fn_oid: pg_sys::Oid) -> anyhow::Result<()
 #[pg_extern]
 #[cfg(feature = "sub")]
 pub fn nats_unsubscribe(subject: String, fn_oid: pg_sys::Oid) -> anyhow::Result<()> {
+    // SAFETY: Calling Postgres backend function which takes no arguments,
+    // has no side effects, and does not rely on any Rust-managed memory.
+    // Safe as long as we are running inside a valid Postgres backend process.
     if unsafe { pgrx::pg_sys::RecoveryInProgress() } {
         anyhow::bail!("Subscriptions are not allowed in replica mode");
     }
@@ -614,6 +623,9 @@ pub fn nats_unsubscribe(subject: String, fn_oid: pg_sys::Oid) -> anyhow::Result<
     crate::bgw::launcher::send_message_to_launcher_with_retry(
         &crate::bgw::LAUNCHER_MESSAGE_BUS,
         crate::bgw::launcher::message::LauncherMessage::Unsubscribe {
+            // SAFETY: `MyDatabaseId` is a Postgres backend global which is initialized
+            // before extension code is executed. Postgres backends are single-threaded,
+            // and this variable is immutable after initialization.
             db_oid: unsafe { pgrx::pg_sys::MyDatabaseId }.to_u32(),
             subject,
             fn_name,
