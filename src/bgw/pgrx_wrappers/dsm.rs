@@ -9,6 +9,10 @@ pub struct DynamicSharedMemory {
 
 impl DynamicSharedMemory {
     pub fn new(size: usize) -> anyhow::Result<Self> {
+        // SAFETY:
+        // `dsm_create` return a pointer managed by Postgres.
+        // The returned pointer is checked for null before being wrapped in `NonNull`.
+        // Lifetime is tied to Postgres dynamic shared memory subsystem.
         let seg = unsafe { sys::dsm_create(size, 0) };
 
         NonNull::new(seg)
@@ -17,6 +21,10 @@ impl DynamicSharedMemory {
     }
 
     pub fn attach(handle: DsmHandle) -> anyhow::Result<Self> {
+        // SAFETY:
+        // `dsm_attach` return a pointer managed by Postgres.
+        // The returned pointer is checked for null before being wrapped in `NonNull`.
+        // Lifetime is tied to Postgres dynamic shared memory subsystem.
         let seg = unsafe { sys::dsm_attach(*handle) };
         NonNull::new(seg)
             .map(|seg| DynamicSharedMemory { seg })
@@ -24,10 +32,16 @@ impl DynamicSharedMemory {
     }
 
     pub fn handle(&self) -> DsmHandle {
+        // SAFETY:
+        // `self.seg` is a valid pointer obtained from Postgres DSM API.
+        // Postgres guarantees that the segment remains valid until detached.
         unsafe { sys::dsm_segment_handle(self.seg.as_ptr()).into() }
     }
 
     pub fn addr(&self) -> *mut ffi::c_void {
+        // SAFETY:
+        // `self.seg` is a valid pointer obtained from Postgres DSM API.
+        // Postgres guarantees that the segment remains valid until detached.
         unsafe { sys::dsm_segment_address(self.seg.as_ptr()) }
     }
 
@@ -38,6 +52,9 @@ impl DynamicSharedMemory {
 
 impl Drop for DynamicSharedMemory {
     fn drop(&mut self) {
+        // SAFETY:
+        // `self.seg` is a valid DSM segment pointer and is detached exactly once.
+        // After this call the pointer must not be used again.
         unsafe { sys::dsm_detach(self.seg.as_ptr()) };
     }
 }

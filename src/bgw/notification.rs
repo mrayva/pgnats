@@ -37,6 +37,12 @@ impl PgInstanceNotification {
 }
 
 fn fetch_config_option(name: &CStr) -> Option<String> {
+    // SAFETY:
+    // 1. `name` is a valid null-terminated C string.
+    // 2. Postgres guarantees the returned pointer (if non-null) is a valid
+    //    null-terminated string allocated in a memory context that lives
+    //    for the duration of this call.
+    // 3. The pointer is checked for null before dereferencing.
     unsafe {
         let value_ptr =
             pgrx::pg_sys::GetConfigOptionByName(name.as_ptr(), std::ptr::null_mut(), true);

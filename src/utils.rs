@@ -21,6 +21,9 @@ impl SysHeapTuple {
 
 impl Drop for SysHeapTuple {
     fn drop(&mut self) {
+        // SAFETY:
+        // `self.inner` was obtained from `SearchSysCache` and must be released
+        // exactly once via `ReleaseSysCache`
         unsafe {
             sys::ReleaseSysCache(self.inner);
         }
@@ -129,6 +132,10 @@ pub fn unpack_i64_to_oid_dsmh(value: i64) -> (sys::Oid, DsmHandle) {
 }
 
 pub fn get_database_name(oid: sys::Oid) -> Option<String> {
+    // SAFETY:
+    // 1. Postgres returns either a null pointer or a valid null-terminated string.
+    // 2. The pointer is checked for null before dereferencing.
+    // 3. The string remains valid for the duration of this call.
     let db_name = unsafe {
         let db_name = sys::get_database_name(oid);
 
@@ -152,6 +159,12 @@ pub fn is_extension_installed(name: &str) -> bool {
 }
 
 pub fn resolve_bytea_name(func_oid: sys::Oid) -> anyhow::Result<Option<String>> {
+    // SAFETY:
+    // 1. All Postgres FFI calls follow documented lifetimes.
+    // 2. `SearchSysCache` result is wrapped in `SysHeapTuple` to ensure proper release.
+    // 3. Returned C strings are checked for null before dereferencing.
+    // 4. Argument metadata pointers returned by Postgres remain valid for the
+    //    lifetime of the syscache tuple.
     unsafe {
         let schema_oid = sys::get_func_namespace(func_oid);
         let schema_name = sys::get_namespace_name(schema_oid);

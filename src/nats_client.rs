@@ -251,6 +251,7 @@ impl NatsClient {
 }
 
 impl NatsClient {
+    #[allow(clippy::expect_used)]
     async fn get_connection(&mut self) -> anyhow::Result<&Client> {
         if self.connection.is_none() {
             self.initialize_connection().await?;
@@ -262,6 +263,7 @@ impl NatsClient {
             .expect("unreachable, must be initialized"))
     }
 
+    #[allow(clippy::expect_used)]
     async fn get_jetstream(&mut self) -> anyhow::Result<&Context> {
         if self.connection.is_none() {
             self.initialize_connection().await?;
@@ -273,6 +275,7 @@ impl NatsClient {
             .expect("unreachable, must be initialized"))
     }
 
+    #[allow(clippy::expect_used)]
     async fn get_or_create_bucket(&mut self, bucket: impl ToString) -> anyhow::Result<&Store> {
         let bucket = bucket.to_string();
 
@@ -301,6 +304,7 @@ impl NatsClient {
             .expect("unreachable, must be initialized"))
     }
 
+    #[allow(clippy::expect_used)]
     async fn get_or_create_object_store(
         &mut self,
         store: impl ToString,

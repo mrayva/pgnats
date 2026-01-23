@@ -1,10 +1,10 @@
-use pgrx::{PgLwLock, extension_sql, pg_extern, pg_sys as sys};
+use pgrx::{extension_sql, pg_extern, pg_sys as sys, PgLwLock};
 
 use crate::{
     bgw::{
-        LAUNCHER_MESSAGE_BUS,
         launcher::{message::LauncherMessage, send_message_to_launcher_with_retry},
         ring_queue::RingQueue,
+        LAUNCHER_MESSAGE_BUS,
     },
     config::parse_config,
     error,
@@ -70,6 +70,9 @@ pub fn fdw_validator<const N: usize>(
         if let Err(err) = send_message_to_launcher_with_retry(
             launcher_bus,
             LauncherMessage::NewConfig {
+                // SAFETY: `MyDatabaseId` is a Postgres backend global which is initialized
+                // before extension code is executed. Postgres backends are single-threaded,
+                // and this variable is immutable after initialization.
                 db_oid: unsafe { sys::MyDatabaseId }.to_u32(),
                 config,
             },

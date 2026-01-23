@@ -11,6 +11,9 @@ pub struct Context {
     pub rt: tokio::runtime::Runtime,
 }
 
+// The extension is useless without tokio runtime. It has to panic if the runtime cannot be initialized.
+// pgrx will handle the panic properly.
+#[allow(clippy::expect_used)]
 fn create_context() -> Context {
     Context {
         nats_connection: NatsClient::new(None, || fetch_config(FDW_EXTENSION_NAME)),
