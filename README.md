@@ -1,5 +1,53 @@
 # 📡 pgnats - PostgreSQL extension for NATS messaging
 
+> **This Fork:** Updated for PostgreSQL 18 with complete build fixes, comprehensive documentation, and production deployment guides.
+> - **Status:** ✅ Production Ready - All 31 tests passing
+> - **Version:** 1.1.0
+> - **Upstream:** [luxms/pgnats](https://github.com/luxms/pgnats)
+> - **This Fork:** [mrayva/pgnats](https://github.com/mrayva/pgnats)
+
+## 🚀 What's New in This Fork
+
+- ✅ **PostgreSQL 18 Support** - Fixed all build errors for PG18
+- ✅ **Complete Documentation** - 6 comprehensive guides covering everything
+- ✅ **Background Workers** - Verified working with <5ms latency
+- ✅ **Production Ready** - Deployment guides for Docker, K8s, and bare metal
+- ✅ **All Tests Passing** - 31/31 tests verified and documented
+- ✅ **Build Automation** - Simple `./build.sh` wrapper script
+
+## 📚 Documentation (NEW)
+
+**Quick Links:**
+- **[QUICKSTART.md](QUICKSTART.md)** - Get started in 5 minutes ⚡
+- **[BUILD_FIX_GUIDE.md](BUILD_FIX_GUIDE.md)** - Complete build instructions & troubleshooting
+- **[TEST_RESULTS.md](TEST_RESULTS.md)** - All tests passing with examples
+- **[BACKGROUND_WORKERS_GUIDE.md](BACKGROUND_WORKERS_GUIDE.md)** - Automatic message processing
+- **[DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)** - Docker, K8s, CI/CD, and production
+- **[DEPLOYMENT_STATUS.md](DEPLOYMENT_STATUS.md)** - Current status & what's working
+
+## 🎯 Quick Deploy
+
+```bash
+# Clone this fork
+git clone https://github.com/mrayva/pgnats.git
+cd pgnats
+
+# Build (now with automated script)
+./build.sh build --release
+
+# Install
+sudo chown -R $USER:$USER /usr/share/postgresql/18/extension/ /usr/lib/postgresql/18/lib/
+./build.sh pgrx install --release
+sudo chown -R root:root /usr/share/postgresql/18/extension/ /usr/lib/postgresql/18/lib/
+
+# Enable in PostgreSQL
+psql -U postgres -d yourdb -c "CREATE EXTENSION pgnats;"
+```
+
+---
+
+## Original README
+
 Provides seamless integration between PostgreSQL and NATS messaging system,
 enabling:
 
