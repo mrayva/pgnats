@@ -12,7 +12,7 @@ name = "pgrx_embed_pgnats"
 path = "./src/bin/pgrx_embed.rs"
 
 [features]
-default = ["pg14", "kv", "object_store", "sub"]
+default = ["pg18", "kv", "object_store", "sub"]
 pg_test = ["warp"]
 pg13 = ["pgrx/pg13", "pgrx-tests/pg13"]
 pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
@@ -22,7 +22,7 @@ pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
 
 # pgrx fork feature
-xid8 = ["pgrx/xid8", "pgrx-tests/xid8"]
+#xid8 = ["pgrx/xid8", "pgrx-tests/xid8"]
 
 # extension features
 kv = []
@@ -34,7 +34,7 @@ anyhow = { version = "1.0", default-features = false }
 async-nats = { version = "0.45.0" }
 futures = "0.3.31"
 pastey = "0.2.1"
-pgrx = { git = "https://github.com/luxms/pgrx", version = "0.15.0", features = [
+pgrx = { version = "0.16.1", features = [
     "unsafe-postgres",
 ] }
 serde = { version = "1.0.219", features = ["derive"] }
@@ -54,7 +54,7 @@ shadow-rs = { version = "1.0.0", default-features = false }
 warp = { optional = true, version = "0.3.7", default-features = false }
 
 [dev-dependencies]
-pgrx-tests = { git = "https://github.com/luxms/pgrx", version = "0.15.0" }
+pgrx-tests = { version = "0.16.1" }
 
 [build-dependencies]
 anyhow = { version = "1.0", default-features = false }

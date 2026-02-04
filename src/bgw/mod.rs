@@ -1,5 +1,5 @@
 use pgrx::{
-    PgLwLock, PgSharedMemoryInitialization,
+    PgLwLock,
     bgworkers::{BackgroundWorkerBuilder, BgWorkerStartTime},
     pg_shmem_init,
     prelude::*,
@@ -63,8 +63,9 @@ extension_sql!(
     requires = ["create_subscriptions_table"]
 );
 
-pub static LAUNCHER_MESSAGE_BUS: PgLwLock<RingQueue<MESSAGE_BUS_SIZE>> =
-    PgLwLock::new(c"pgnats_launcher_message_bus");
+pub static LAUNCHER_MESSAGE_BUS: PgLwLock<RingQueue<MESSAGE_BUS_SIZE>> = unsafe {
+    PgLwLock::new(c"pgnats_launcher_message_bus")
+};
 
 pub fn init_background_worker_launcher() {
     pg_shmem_init!(LAUNCHER_MESSAGE_BUS);
