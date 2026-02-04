@@ -1,6 +1,6 @@
 #[cfg(any(test, feature = "pg_test"))]
 pub fn init_test_shared_memory() {
-    use pgrx::{PgSharedMemoryInitialization, pg_guard, pg_shmem_init, pg_sys};
+    use pgrx::{pg_guard, pg_shmem_init, pg_sys};
 
     use crate::pg_tests::bgw_tests::tests_items::*;
 
