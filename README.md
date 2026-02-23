@@ -128,6 +128,22 @@ The exported PostgreSQL API is implemented in the `api` module.
 
 ## 📘 Usage
 
+### ⚠️ Prerequisites
+
+**Important:** pgnats must be loaded at PostgreSQL startup. Add it to `postgresql.conf`:
+
+```conf
+shared_preload_libraries = 'pgnats'
+```
+
+Then restart PostgreSQL:
+
+```bash
+sudo systemctl restart postgresql
+```
+
+Without this, you'll get `ERROR: PgLwLock was not initialized` when creating the server.
+
 ### ⚙️ Configuration
 
 To configure the NATS connection, you need to create a Foreign Server:
