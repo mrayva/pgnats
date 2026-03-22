@@ -3,6 +3,7 @@ mod nats;
 
 pub mod message;
 pub mod pg_api;
+pub(crate) use nats::NatsConnectionState;
 
 use std::sync::{
     mpsc::{channel, Sender},
@@ -28,7 +29,6 @@ use crate::{
         subscriber::{
             context::SubscriberContext,
             message::{InternalWorkerMessage, SubscriberMessage},
-            nats::NatsConnectionState,
             pg_api::{call_function, delete_subject_callback, insert_subject_callback},
         },
         LAUNCHER_MESSAGE_BUS, SUBSCRIPTIONS_TABLE_NAME,

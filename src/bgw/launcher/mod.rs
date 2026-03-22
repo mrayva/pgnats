@@ -104,7 +104,14 @@ pub fn process_launcher_bus<const N: usize>(
                         db_oid
                     );
 
-                    ctx.register_worker(db_oid);
+                    if let Err(err) = ctx.register_worker(db_oid) {
+                        warn!(
+                            context = LAUNCHER_CTX,
+                            "Failed to register worker for db_oid {}: {}",
+                            db_oid,
+                            err
+                        );
+                    }
                 }
                 ExtensionStatus::NoExtension => {
                     log!(

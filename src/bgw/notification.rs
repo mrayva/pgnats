@@ -64,8 +64,5 @@ fn try_fetch_patroni_name(url: &str) -> Option<String> {
             .ok_or(anyhow::anyhow!("Field name is missing"))
     };
 
-    match result() {
-        Ok(ok) => Some(ok),
-        Err(err) => Some(err.to_string()),
-    }
+    result().ok()
 }

@@ -48,7 +48,7 @@ impl NatsClient {
         let subject = subject.to_string();
         let message: Vec<u8> = message.to_bytes()?;
         let conn = self.get_connection().await?;
-        let headers = headers.map(extract_headers);
+        let headers = headers.map(extract_headers).transpose()?;
 
         if let Some(reply) = reply {
             let reply = reply.to_string();
@@ -104,7 +104,7 @@ impl NatsClient {
     ) -> anyhow::Result<()> {
         let subject = subject.to_string();
         let message: Vec<u8> = message.to_bytes()?;
-        let headers = headers.map(extract_headers);
+        let headers = headers.map(extract_headers).transpose()?;
         let js = self.get_jetstream().await?;
 
         if let Some(headers) = headers {

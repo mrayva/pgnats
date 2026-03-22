@@ -15,6 +15,7 @@ use crate::{
 #[derive(Default)]
 pub struct LauncherContext {
     pending_workers: HashMap<u32, WorkerEntry<RunningState>>,
+    pending_messages: HashMap<u32, Vec<SubscriberMessage>>,
     workers: HashMap<u32, WorkerEntry<RunningState>>,
     terminated_workers: HashMap<u32, WorkerEntry<TerminatedState>>,
     counter: usize,
@@ -27,10 +28,16 @@ impl LauncherContext {
         }
     }
 
-    pub fn register_worker(&mut self, db_oid: u32) {
-        if let Some(worker) = self.pending_workers.remove(&db_oid) {
+    pub fn register_worker(&mut self, db_oid: u32) -> anyhow::Result<()> {
+        if let Some(mut worker) = self.pending_workers.remove(&db_oid) {
+            for msg in self.take_pending_messages(db_oid) {
+                send_subscriber_message(&mut worker.sender, msg)?;
+            }
+
             let _ = self.workers.insert(db_oid, worker);
         }
+
+        Ok(())
     }
 
     pub fn handle_new_config_message(
@@ -41,14 +48,32 @@ impl LauncherContext {
     ) -> anyhow::Result<Option<String>> {
         if let Some(entry) = self.workers.get_mut(&db_oid) {
             send_subscriber_message(&mut entry.sender, SubscriberMessage::NewConfig { config })?;
-
             Ok(None)
-        } else if !self.pending_workers.contains_key(&db_oid) {
-            let db_name = self.start_subscribe_worker(db_oid, entry_point)?;
-
-            Ok(Some(db_name))
         } else {
-            Ok(None)
+            let is_new_worker = if !self.pending_workers.contains_key(&db_oid) {
+                self.start_subscribe_worker(db_oid, entry_point)?;
+                true
+            } else {
+                false
+            };
+
+            self.pending_messages
+                .get_mut(&db_oid)
+                .ok_or_else(|| anyhow::anyhow!("Worker for db_oid {db_oid} was not initialized"))?
+                .push(SubscriberMessage::NewConfig { config });
+
+            if is_new_worker {
+                Ok(Some(
+                    self.pending_workers
+                        .get(&db_oid)
+                        .map(|worker| worker.db_name.clone())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Worker for db_oid {db_oid} was not initialized")
+                        })?,
+                ))
+            } else {
+                Ok(None)
+            }
         }
     }
 
@@ -63,6 +88,10 @@ impl LauncherContext {
                 &mut entry.sender,
                 SubscriberMessage::Subscribe { subject, fn_name },
             )?;
+        } else if let Some(buffered_messages) = self.pending_messages.get_mut(&db_oid) {
+            buffered_messages.push(SubscriberMessage::Subscribe { subject, fn_name });
+        } else {
+            anyhow::bail!("No subscriber worker found for db_oid {db_oid}");
         }
 
         Ok(())
@@ -79,6 +108,10 @@ impl LauncherContext {
                 &mut entry.sender,
                 SubscriberMessage::Unsubscribe { subject, fn_name },
             )?;
+        } else if let Some(buffered_messages) = self.pending_messages.get_mut(&db_oid) {
+            buffered_messages.push(SubscriberMessage::Unsubscribe { subject, fn_name });
+        } else {
+            anyhow::bail!("No subscriber worker found for db_oid {db_oid}");
         }
 
         Ok(())
@@ -119,11 +152,13 @@ impl LauncherContext {
         self.counter += 1;
         let db_name = entry.db_name.clone();
         let _ = self.pending_workers.insert(oid, entry);
+        let _ = self.pending_messages.insert(oid, Vec::new());
 
         Ok(db_name)
     }
 
     pub fn shutdown_worker(&mut self, db_oid: u32) {
+        let _ = self.pending_messages.remove(&db_oid);
         let Some(entry) = self
             .workers
             .remove(&db_oid)
@@ -143,6 +178,7 @@ impl LauncherContext {
         for (_, v) in std::mem::take(&mut self.pending_workers) {
             self.shutdown_worker_entry(v);
         }
+        self.pending_messages.clear();
     }
 
     pub fn shutdown_worker_entry(&mut self, entry: WorkerEntry<RunningState>) {
@@ -152,6 +188,20 @@ impl LauncherContext {
 
     pub fn get_worker(&self, db_oid: u32) -> Option<&WorkerEntry<RunningState>> {
         self.workers.get(&db_oid)
+    }
+
+    #[cfg(any(test, feature = "pg_test"))]
+    pub(crate) fn take_pending_messages_for_test(&mut self, db_oid: u32) -> Vec<SubscriberMessage> {
+        self.take_pending_messages(db_oid)
+    }
+
+    #[cfg(any(test, feature = "pg_test"))]
+    pub(crate) fn init_pending_messages_for_test(&mut self, db_oid: u32) {
+        let _ = self.pending_messages.insert(db_oid, Vec::new());
+    }
+
+    fn take_pending_messages(&mut self, db_oid: u32) -> Vec<SubscriberMessage> {
+        self.pending_messages.remove(&db_oid).unwrap_or_default()
     }
 }
 

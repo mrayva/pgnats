@@ -106,18 +106,37 @@ impl ToBytes for pgrx::JsonB {
     }
 }
 
-pub(crate) fn extract_headers(v: serde_json::Value) -> async_nats::HeaderMap {
+pub(crate) fn extract_headers(v: serde_json::Value) -> anyhow::Result<async_nats::HeaderMap> {
     let mut map = async_nats::HeaderMap::new();
+    let obj = v
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("headers must be a JSON object"))?;
 
-    if let Some(obj) = v.as_object() {
-        for (k, v) in obj {
-            if let Some(v) = v.as_str() {
-                map.append(k.as_str(), v);
+    for (key, value) in obj {
+        match value {
+            serde_json::Value::String(value) => map.append(key.as_str(), value.as_str()),
+            serde_json::Value::Array(values) => {
+                anyhow::ensure!(
+                    !values.is_empty(),
+                    "header '{key}' must not contain an empty array"
+                );
+
+                for value in values {
+                    let value = value.as_str().ok_or_else(|| {
+                        anyhow::anyhow!("header '{key}' array values must be strings")
+                    })?;
+                    map.append(key.as_str(), value);
+                }
+            }
+            _ => {
+                anyhow::bail!(
+                    "header '{key}' must be a string or an array of strings"
+                );
             }
         }
     }
 
-    map
+    Ok(map)
 }
 
 pub fn pack_oid_dsmh_to_i64(oid: sys::Oid, dsmh: DsmHandle) -> i64 {

@@ -85,10 +85,6 @@ pub fn fetch_config(fdw_extension_name: &str) -> Config {
                     continue;
                 }
 
-                #[cfg(any(feature = "pg13", feature = "pg14"))]
-                let val = (*(node as *mut pgrx::pg_sys::Value)).val.str_;
-
-                #[cfg(not(any(feature = "pg13", feature = "pg14")))]
                 let val = (*(node as *mut pgrx::pg_sys::String)).sval;
 
                 if val.is_null() {

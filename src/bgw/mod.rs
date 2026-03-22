@@ -63,6 +63,10 @@ extension_sql!(
     requires = ["create_subscriptions_table"]
 );
 
+// SAFETY:
+// `RingQueue` implements `PGRXSharedMemory`, has a stable layout, and this
+// static is initialized exactly once for placement in Postgres shared memory.
+#[allow(clippy::undocumented_unsafe_blocks)]
 pub static LAUNCHER_MESSAGE_BUS: PgLwLock<RingQueue<MESSAGE_BUS_SIZE>> = unsafe {
     PgLwLock::new(c"pgnats_launcher_message_bus")
 };

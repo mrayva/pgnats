@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::undocumented_unsafe_blocks, clippy::unwrap_used)]
+
 #[cfg(any(test, feature = "pg_test"))]
 pub fn init_test_shared_memory() {
     use pgrx::{pg_guard, pg_shmem_init, pg_sys};
@@ -146,6 +148,7 @@ pub(super) mod tests {
     use crate::{
         api,
         bgw::{
+            launcher::context::LauncherContext,
             notification::PgInstanceNotification, ring_queue::RingQueue,
             subscriber::pg_api::PgInstanceStatus,
         },
@@ -355,20 +358,12 @@ pub(super) mod tests {
 
             assert_eq!(message.status, PgInstanceStatus::Master);
 
-            assert!(!message.listen_addresses.is_empty());
-            assert_eq!(message.listen_addresses[0], "localhost");
+            let first_listen_address = message
+                .listen_addresses
+                .first()
+                .expect("missing listen address");
+            assert_eq!(first_listen_address, "localhost");
 
-            #[cfg(feature = "pg13")]
-            assert_eq!(message.port, 32213);
-            #[cfg(feature = "pg14")]
-            assert_eq!(message.port, 32214);
-            #[cfg(feature = "pg15")]
-            assert_eq!(message.port, 32215);
-            #[cfg(feature = "pg16")]
-            assert_eq!(message.port, 32216);
-            #[cfg(feature = "pg17")]
-            assert_eq!(message.port, 32217);
-            #[cfg(feature = "pg18")]
             assert_eq!(message.port, 32218);
 
             assert_eq!(message.name.unwrap().as_str(), table_name);
@@ -488,6 +483,122 @@ pub(super) mod tests {
 
         let terminate = worker.terminate();
         terminate.wait_for_shutdown().unwrap();
+    }
+
+    #[pg_test]
+    fn test_launcher_buffers_pending_messages() {
+        use crate::bgw::subscriber::message::SubscriberMessage;
+
+        let mut ctx = LauncherContext::default();
+        let db_oid = unsafe { pgrx::pg_sys::MyDatabaseId }.to_u32();
+        ctx.init_pending_messages_for_test(db_oid);
+
+        ctx.handle_subscribe_message(
+            db_oid,
+            "subject.buffered".to_string(),
+            "fn_buffered".to_string(),
+        )
+        .unwrap();
+        ctx.handle_unsubscribe_message(
+            db_oid,
+            "subject.buffered".to_string(),
+            "fn_buffered".to_string(),
+        )
+        .unwrap();
+
+        let buffered = ctx.take_pending_messages_for_test(db_oid);
+        assert_eq!(buffered.len(), 2);
+
+        assert!(matches!(
+            buffered.first(),
+            Some(SubscriberMessage::Subscribe { subject, fn_name })
+                if subject == "subject.buffered" && fn_name == "fn_buffered"
+        ));
+
+        assert!(matches!(
+            buffered.get(1),
+            Some(SubscriberMessage::Unsubscribe { subject, fn_name })
+                if subject == "subject.buffered" && fn_name == "fn_buffered"
+        ));
+
+    }
+
+    #[pg_test]
+    fn test_launcher_missing_worker_errors() {
+        let mut ctx = LauncherContext::default();
+
+        let result = ctx.handle_subscribe_message(
+            unsafe { pgrx::pg_sys::MyDatabaseId }.to_u32(),
+            "subject.missing".to_string(),
+            "fn_missing".to_string(),
+        );
+
+        assert!(result.is_err(), "missing worker should not silently drop subscribe");
+    }
+
+    #[pg_test]
+    fn test_subscription_stream_end_cleanup() {
+        use std::sync::{mpsc::channel, Arc};
+
+        use tokio_stream::iter;
+
+        use crate::bgw::subscriber::{
+            message::InternalWorkerMessage, NatsConnectionState,
+        };
+
+        fn build_message(subject: &str, payload: &[u8]) -> async_nats::Message {
+            async_nats::Message {
+                subject: subject.into(),
+                reply: None,
+                payload: payload.to_vec().into(),
+                headers: None,
+                status: None,
+                description: None,
+                length: payload.len(),
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to initialize tokio runtime");
+        let (sender, receiver) = channel();
+        let subject: Arc<str> = Arc::from("subject.test");
+        let mut stream = iter(vec![
+            build_message("subject.test", b"one"),
+            build_message("subject.test", b"two"),
+        ]);
+
+        rt.block_on(NatsConnectionState::forward_subscription_stream_for_test(
+            &mut stream,
+            sender,
+            subject.clone(),
+        ));
+
+        assert!(matches!(
+            receiver.recv().expect("missing first callback"),
+            InternalWorkerMessage::CallbackCall {
+                subject: callback_subject,
+                data,
+            } if callback_subject.as_ref() == subject.as_ref() && data.as_ref() == b"one"
+        ));
+
+        assert!(matches!(
+            receiver.recv().expect("missing second callback"),
+            InternalWorkerMessage::CallbackCall {
+                subject: callback_subject,
+                data,
+            } if callback_subject.as_ref() == subject.as_ref() && data.as_ref() == b"two"
+        ));
+
+        assert!(matches!(
+            receiver.recv().expect("missing unsubscribe notification"),
+            InternalWorkerMessage::UnsubscribeSubject {
+                subject: unsubscribed_subject,
+                reason,
+            } if unsubscribed_subject.as_ref() == subject.as_ref()
+                && reason == "subscription stream ended"
+        ));
     }
 
     fn pgnats_subscribe<const N: usize>(

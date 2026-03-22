@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::prelude::pg_schema]
 mod tests {
@@ -52,12 +54,45 @@ mod tests {
 
     #[pg_test]
     fn test_pgnats_publish_with_reply_and_headers() {
+        use std::sync::mpsc::channel;
+
+        use futures::StreamExt;
         use pgrx::JsonB;
         use serde_json::json;
 
         let subject = "test.test_nats_publish";
         let reply_to = "test.reply";
         let message = b"payload".to_vec();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (sdr, rcv) = channel();
+
+        let handle = rt.spawn(async move {
+            let client = async_nats::connect(format!("{NATS_HOST}:{NATS_PORT}"))
+                .await
+                .expect("failed to connect to NATS server");
+
+            let mut subscriber = client
+                .subscribe(subject.to_string())
+                .await
+                .expect("failed to subscribe");
+
+            sdr.send(()).unwrap();
+
+            let first = subscriber.next().await.expect("missing first message");
+            let second = subscriber.next().await.expect("missing second message");
+            let third = subscriber.next().await.expect("missing third message");
+
+            (first, second, third)
+        });
+
+        rcv.recv().unwrap();
+
+        let mut expected_headers = async_nats::HeaderMap::new();
+        expected_headers.append("x-id", "123");
+        expected_headers.append("x-type", "unit-test");
 
         let res = api::nats_publish_binary(subject, message.clone(), Some(reply_to), None);
         assert!(res.is_ok(), "publish with reply failed: {:?}", res);
@@ -81,6 +116,36 @@ mod tests {
             "publish with reply + headers failed: {:?}",
             res
         );
+
+        let (first, second, third) = rt.block_on(handle).unwrap();
+
+        assert_eq!(first.reply.as_deref(), Some(reply_to));
+        assert!(first.headers.is_none());
+        assert_eq!(first.payload.as_ref(), message.as_slice());
+
+        assert!(second.reply.is_none());
+        assert_eq!(second.headers.as_ref(), Some(&expected_headers));
+        assert_eq!(second.payload.as_ref(), message.as_slice());
+
+        assert_eq!(third.reply.as_deref(), Some(reply_to));
+        assert_eq!(third.headers.as_ref(), Some(&expected_headers));
+        assert_eq!(third.payload.as_ref(), message.as_slice());
+    }
+
+    #[pg_test]
+    fn test_pgnats_publish_rejects_invalid_headers() {
+        use pgrx::JsonB;
+
+        let res = api::nats_publish_binary(
+            "test.test_nats_publish_invalid_headers",
+            b"payload".to_vec(),
+            None,
+            Some(JsonB(serde_json::json!({
+                "x-id": [123]
+            }))),
+        );
+
+        assert!(res.is_err(), "invalid headers should be rejected");
     }
 
     #[pg_test]

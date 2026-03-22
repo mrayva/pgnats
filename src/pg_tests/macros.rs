@@ -1,13 +1,18 @@
+#![allow(clippy::macro_metavars_in_unsafe, clippy::expect_used, clippy::undocumented_unsafe_blocks)]
+
 #[macro_export]
+#[allow(clippy::macro_metavars_in_unsafe)]
 macro_rules! generate_test_background_worker {
     ($n:literal, $launcher_name:expr, $result_name:expr, $sql_ext_name:literal, $sql:literal) => {
         ::pastey::paste! {
             #[allow(non_upper_case_globals)]
+            #[allow(clippy::macro_metavars_in_unsafe)]
             pub(super) static [<LAUNCHER_MESSAGE_BUS $n>]: pgrx::PgLwLock<$crate::bgw::ring_queue::RingQueue<1024>> = unsafe {
                 pgrx::PgLwLock::new($launcher_name)
             };
 
             #[allow(non_upper_case_globals)]
+            #[allow(clippy::macro_metavars_in_unsafe)]
             pub(super) static [<TEST_RESULT $n>]: pgrx::PgLwLock<u64> = unsafe {
                 pgrx::PgLwLock::new($result_name)
             };

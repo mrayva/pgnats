@@ -23,7 +23,7 @@ pub enum SubscriberMessage {
     },
 }
 
-pub(super) enum InternalWorkerMessage {
+pub(crate) enum InternalWorkerMessage {
     Subscribe {
         register: bool,
         subject: String,

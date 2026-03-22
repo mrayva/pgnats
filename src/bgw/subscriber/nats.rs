@@ -3,6 +3,7 @@ use std::{
     sync::{mpsc::Sender, Arc},
 };
 
+use futures::Stream;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
@@ -12,12 +13,12 @@ use crate::{
     warn,
 };
 
-pub(super) struct NatsSubscription {
+pub(crate) struct NatsSubscription {
     handler: JoinHandle<()>,
     funcs: HashSet<Arc<str>>,
 }
 
-pub(super) struct NatsConnectionState {
+pub(crate) struct NatsConnectionState {
     client: async_nats::Client,
     subscriptions: HashMap<Arc<str>, NatsSubscription>,
 }
@@ -182,12 +183,7 @@ impl NatsConnectionState {
         rt.spawn(async move {
             match client.subscribe(subject.to_string()).await {
                 Ok(mut sub) => {
-                    while let Some(msg) = sub.next().await {
-                        let _ = sender.send(InternalWorkerMessage::CallbackCall {
-                            subject: subject.clone(),
-                            data: Arc::from(msg.payload.to_vec()),
-                        });
-                    }
+                    Self::forward_subscription_stream(&mut sub, sender, subject).await;
                 }
                 Err(err) => {
                     let _ = sender.send(InternalWorkerMessage::UnsubscribeSubject {
@@ -197,6 +193,37 @@ impl NatsConnectionState {
                 }
             }
         })
+    }
+
+    async fn forward_subscription_stream<S>(
+        sub: &mut S,
+        sender: Sender<InternalWorkerMessage>,
+        subject: Arc<str>,
+    ) where
+        S: Stream<Item = async_nats::Message> + Unpin,
+    {
+        while let Some(msg) = sub.next().await {
+            let _ = sender.send(InternalWorkerMessage::CallbackCall {
+                subject: subject.clone(),
+                data: Arc::from(msg.payload.to_vec()),
+            });
+        }
+
+        let _ = sender.send(InternalWorkerMessage::UnsubscribeSubject {
+            subject,
+            reason: "subscription stream ended".to_string(),
+        });
+    }
+
+    #[cfg(any(test, feature = "pg_test"))]
+    pub(crate) async fn forward_subscription_stream_for_test<S>(
+        sub: &mut S,
+        sender: Sender<InternalWorkerMessage>,
+        subject: Arc<str>,
+    ) where
+        S: Stream<Item = async_nats::Message> + Unpin,
+    {
+        Self::forward_subscription_stream(sub, sender, subject).await;
     }
 }
 

@@ -1,3 +1,5 @@
+#![allow(clippy::undocumented_unsafe_blocks, clippy::unwrap_used)]
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::prelude::pg_schema]
 mod tests {

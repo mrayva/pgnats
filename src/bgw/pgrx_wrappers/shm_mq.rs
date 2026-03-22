@@ -68,15 +68,6 @@ impl ShmMqSender {
         //    that lives for the duration of the call.
         // 3. Postgres does not retain the pointer after returning.
         let res = unsafe {
-            #[cfg(any(feature = "pg13", feature = "pg14"))]
-            let res = sys::shm_mq_send(
-                self.mqh.as_mut(),
-                data.len(),
-                data.as_ptr() as *const _,
-                no_wait,
-            );
-
-            #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17", feature = "pg18"))]
             let res = sys::shm_mq_send(
                 self.mqh.as_mut(),
                 data.len(),

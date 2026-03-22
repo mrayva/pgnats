@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use pgrx::PGRXSharedMemory;
 
 const HEADER_SIZE: usize = size_of::<usize>();
