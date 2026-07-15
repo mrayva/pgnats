@@ -1,4 +1,4 @@
-use std::ffi::CStr;
+use std::{ffi::CStr, path::{Path, PathBuf}};
 
 use crate::bgw::pgrx_wrappers::dsm::DsmHandle;
 
@@ -175,6 +175,18 @@ pub fn is_extension_installed(name: &str) -> bool {
         let result = client.select(query, None, &[name.into()]);
         result.is_ok_and(|tuple| !tuple.is_empty())
     })
+}
+
+pub(crate) fn resolve_config_path(path: &str) -> anyhow::Result<PathBuf> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+
+    let root = std::env::current_dir()
+        .map_err(|err| anyhow::anyhow!("failed to resolve current directory for TLS path '{path:?}': {err}"))?;
+
+    Ok(root.join(path))
 }
 
 #[allow(trivial_numeric_casts)]

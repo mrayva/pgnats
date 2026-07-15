@@ -303,6 +303,7 @@ pub(super) mod tests {
     #[pg_test]
     fn test_background_worker_whoami() {
         use pgrx::function_name;
+        use pgrx::Spi;
         use std::sync::mpsc::channel;
 
         let table_name = function_name!().split("::").last().unwrap();
@@ -349,6 +350,9 @@ pub(super) mod tests {
 
         let _ = worker.wait_for_startup().unwrap();
         std::thread::sleep(std::time::Duration::from_secs(3));
+        let expected_port = Spi::get_one::<i32>("SELECT current_setting('port')::int")
+            .expect("failed to fetch PostgreSQL port")
+            .expect("PostgreSQL port setting should exist") as u16;
 
         {
             let message = sub_recv
@@ -364,7 +368,7 @@ pub(super) mod tests {
                 .expect("missing listen address");
             assert_eq!(first_listen_address, "localhost");
 
-            assert_eq!(message.port, 32218);
+            assert_eq!(message.port, expected_port);
 
             assert_eq!(message.name.unwrap().as_str(), table_name);
         }

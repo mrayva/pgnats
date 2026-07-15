@@ -94,14 +94,14 @@ macro_rules! report {
         pgrx::ereport!(
             $level,
             pgrx::PgSqlErrorCode::ERRCODE_SUCCESSFUL_COMPLETION,
-            &format!("[PGNATS({})]: {}", $ctx, format!($($msg)*))
+            format!("[PGNATS({})]: {}", $ctx, format!($($msg)*))
         )
     };
     ($level:expr, $($msg:tt)*) => {
         pgrx::ereport!(
             $level,
             pgrx::PgSqlErrorCode::ERRCODE_SUCCESSFUL_COMPLETION,
-            &format!("[PGNATS]: {}", format!($($msg)*))
+            format!("[PGNATS]: {}", format!($($msg)*))
         )
     };
 }

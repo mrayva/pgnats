@@ -10,6 +10,7 @@ use tokio_stream::StreamExt;
 use crate::{
     bgw::subscriber::{pg_api::CallError, InternalWorkerMessage},
     config::{NatsConnectionOptions, NatsTlsOptions},
+    utils::resolve_config_path,
     warn,
 };
 
@@ -154,17 +155,20 @@ impl NatsConnectionState {
         let mut opts = async_nats::ConnectOptions::new().client_capacity(config.capacity);
 
         if let Some(tls) = &config.tls {
-            if let Ok(root) = std::env::current_dir() {
-                match tls {
-                    NatsTlsOptions::Tls { ca } => {
-                        opts = opts.require_tls(true).add_root_certificates(root.join(ca));
-                    }
-                    NatsTlsOptions::MutualTls { ca, cert, key } => {
-                        opts = opts
-                            .require_tls(true)
-                            .add_root_certificates(root.join(ca))
-                            .add_client_certificate(root.join(cert), root.join(key));
-                    }
+            match tls {
+                NatsTlsOptions::Tls { ca } => {
+                    opts = opts
+                        .require_tls(true)
+                        .add_root_certificates(resolve_config_path(ca)?);
+                }
+                NatsTlsOptions::MutualTls { ca, cert, key } => {
+                    opts = opts
+                        .require_tls(true)
+                        .add_root_certificates(resolve_config_path(ca)?)
+                        .add_client_certificate(
+                            resolve_config_path(cert)?,
+                            resolve_config_path(key)?,
+                        );
                 }
             }
         }

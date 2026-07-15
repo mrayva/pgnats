@@ -41,8 +41,7 @@ impl ShmMqSender {
             sys::shm_mq_attach(mq, dsm.as_ptr(), null_mut())
         };
 
-        NonNull::new(mq)
-            .and_then(|mq| NonNull::new(mqh).map(|mqh| (mq, mqh)))
+        NonNull::new(mq).zip(NonNull::new(mqh))
             .map(|(mq, mqh)| Self { mq, mqh })
             .ok_or_else(|| anyhow::anyhow!("Failed to create Shared Memory Message Queue"))
     }
@@ -135,8 +134,7 @@ impl ShmMqReceiver {
             sys::shm_mq_attach(mq, dsm.as_ptr(), null_mut())
         };
 
-        NonNull::new(mq)
-            .and_then(|mq| NonNull::new(mqh).map(|mqh| (mq, mqh)))
+        NonNull::new(mq).zip(NonNull::new(mqh))
             .map(|(mq, mqh)| Self { mq, mqh })
             .ok_or_else(|| anyhow::anyhow!("Failed to create Shared Memory Message Queue"))
     }

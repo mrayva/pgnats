@@ -54,20 +54,30 @@ mod tests {
 
     #[pg_test]
     fn test_pgnats_publish_with_reply_and_headers() {
-        use std::sync::mpsc::channel;
+        use std::{
+            sync::mpsc::channel,
+            time::{SystemTime, UNIX_EPOCH},
+        };
 
         use futures::StreamExt;
         use pgrx::JsonB;
         use serde_json::json;
 
-        let subject = "test.test_nats_publish";
-        let reply_to = "test.reply";
-        let message = b"payload".to_vec();
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let subject = format!("test.test_nats_publish.reply_headers.{unique_suffix}");
+        let reply_to = format!("test.reply.{unique_suffix}");
+        let first_payload = b"payload-with-reply".to_vec();
+        let second_payload = b"payload-with-headers".to_vec();
+        let third_payload = b"payload-with-reply-and-headers".to_vec();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
         let (sdr, rcv) = channel();
+        let subscriber_subject = subject.clone();
 
         let handle = rt.spawn(async move {
             let client = async_nats::connect(format!("{NATS_HOST}:{NATS_PORT}"))
@@ -75,7 +85,7 @@ mod tests {
                 .expect("failed to connect to NATS server");
 
             let mut subscriber = client
-                .subscribe(subject.to_string())
+                .subscribe(subscriber_subject)
                 .await
                 .expect("failed to subscribe");
 
@@ -94,21 +104,25 @@ mod tests {
         expected_headers.append("x-id", "123");
         expected_headers.append("x-type", "unit-test");
 
-        let res = api::nats_publish_binary(subject, message.clone(), Some(reply_to), None);
+        let res = api::nats_publish_binary(&subject, first_payload.clone(), Some(&reply_to), None);
         assert!(res.is_ok(), "publish with reply failed: {:?}", res);
 
         let headers = json!({
             "x-id": ["123"],
             "x-type": ["unit-test"]
         });
-        let res =
-            api::nats_publish_binary(subject, message.clone(), None, Some(JsonB(headers.clone())));
+        let res = api::nats_publish_binary(
+            &subject,
+            second_payload.clone(),
+            None,
+            Some(JsonB(headers.clone())),
+        );
         assert!(res.is_ok(), "publish with headers failed: {:?}", res);
 
         let res = api::nats_publish_binary(
-            subject,
-            message.clone(),
-            Some(reply_to),
+            &subject,
+            third_payload.clone(),
+            Some(&reply_to),
             Some(JsonB(headers)),
         );
         assert!(
@@ -119,17 +133,17 @@ mod tests {
 
         let (first, second, third) = rt.block_on(handle).unwrap();
 
-        assert_eq!(first.reply.as_deref(), Some(reply_to));
+        assert_eq!(first.reply.as_deref(), Some(reply_to.as_str()));
         assert!(first.headers.is_none());
-        assert_eq!(first.payload.as_ref(), message.as_slice());
+        assert_eq!(first.payload.as_ref(), first_payload.as_slice());
 
         assert!(second.reply.is_none());
         assert_eq!(second.headers.as_ref(), Some(&expected_headers));
-        assert_eq!(second.payload.as_ref(), message.as_slice());
+        assert_eq!(second.payload.as_ref(), second_payload.as_slice());
 
-        assert_eq!(third.reply.as_deref(), Some(reply_to));
+        assert_eq!(third.reply.as_deref(), Some(reply_to.as_str()));
         assert_eq!(third.headers.as_ref(), Some(&expected_headers));
-        assert_eq!(third.payload.as_ref(), message.as_slice());
+        assert_eq!(third.payload.as_ref(), third_payload.as_slice());
     }
 
     #[pg_test]

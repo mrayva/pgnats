@@ -51,6 +51,23 @@ linter:
     - cargo pgrx init --pg14 download
     - cargo clippy -- -D warnings
 
+cleanBuildPg18_3:
+  stage: test
+  before_script:
+    - dnf -y install https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+    - dnf -qy module disable postgresql
+    - dnf -qy --enablerepo=crb install perl-IPC-Run
+    - dnf -y install cargo clang llvm-devel bison flex zlib-devel readline-devel openssl-devel postgresql18 postgresql18-devel
+    - test "$(/usr/pgsql-18/bin/pg_config --version | awk '{print $2}')" = "18.3"
+    - export CARGO_HOME=/tmp/pgnats-cargo-home-clean-pg18_3
+    - export PATH="${CARGO_HOME}/bin:${PATH}"
+    - rm -rf "${CARGO_HOME}"
+    - cargo install cargo-pgrx --version 0.19.1 --locked
+    - "${CARGO_HOME}/bin/cargo-pgrx" init --pg18 /usr/pgsql-18/bin/pg_config --skip-version-check
+  script:
+    - CARGO_HOME=/tmp/pgnats-cargo-home-clean-pg18_3 cargo check
+    - CARGO_HOME=/tmp/pgnats-cargo-home-clean-pg18_3 cargo clippy --all-targets -- -D warnings
+
 buildRpm:
   stage: build
   image: ${HARBOR_HOST}/build/${OS_VER}:rpmBuild

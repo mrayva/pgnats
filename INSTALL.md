@@ -17,7 +17,7 @@
 
 ```sh
 # 1. Install cargo-pgrx
-cargo install cargo-pgrx --git https://github.com/luxms/pgrx --locked
+cargo install cargo-pgrx --version 0.19.1 --locked
 
 # 2. Initialize pgrx
 cargo pgrx init
@@ -37,7 +37,7 @@ cargo pgrx init
 
 ```sh
 # 1. Install cargo-pgrx
-cargo install cargo-pgrx --git https://github.com/luxms/pgrx --locked
+cargo install cargo-pgrx --version 0.19.1 --locked
 
 # 2. Initialize pgrx
 cargo pgrx init [-pg<POSTGRES_VERSION> <path to pg_config>]
@@ -54,7 +54,7 @@ cargo pgrx init [-pg<POSTGRES_VERSION> <path to pg_config>]
 
 ```sh
 # 1. Install cargo-pgrx
-cargo install cargo-pgrx --git https://github.com/luxms/pgrx --locked
+cargo install cargo-pgrx --version 0.19.1 --locked
 
 # 2. Initialize pgrx
 cargo pgrx init -pg<POSTGRES_VERSION> <path to pg_config>
@@ -66,7 +66,7 @@ cargo pgrx init -pg<POSTGRES_VERSION> <path to pg_config>
 
 ```sh
 # 1. Install cargo-pgrx
-cargo install cargo-pgrx --git https://github.com/luxms/pgrx --locked
+cargo install cargo-pgrx --version 0.19.1 --locked
 
 # 2. Initialize pgrx
 cargo pgrx init [-pg<POSTGRES_VERSION> <path to pg_config>]

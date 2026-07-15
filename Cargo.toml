@@ -7,10 +7,6 @@ rust-version = "1.82.0"
 [lib]
 crate-type = ["cdylib", "lib"]
 
-[[bin]]
-name = "pgrx_embed_pgnats"
-path = "./src/bin/pgrx_embed.rs"
-
 [features]
 default = ["pg18", "kv", "object_store", "sub"]
 pg_test = ["warp"]
@@ -20,6 +16,7 @@ pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
 pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg19 = ["pgrx/pg19", "pgrx-tests/pg19"]
 
 # pgrx fork feature
 #xid8 = ["pgrx/xid8", "pgrx-tests/xid8"]
@@ -34,7 +31,7 @@ anyhow = { version = "1.0", default-features = false }
 async-nats = { version = "0.45.0" }
 futures = "0.3.31"
 pastey = "0.2.1"
-pgrx = { version = "0.16.1", features = [
+pgrx = { git = "https://github.com/pgcentralfoundation/pgrx.git", rev = "58147f1a5d6168ef36be58200e6e4527cb6cc772", version = "0.19.1", features = [
     "unsafe-postgres",
 ] }
 serde = { version = "1.0.219", features = ["derive"] }
@@ -54,7 +51,7 @@ shadow-rs = { version = "1.0.0", default-features = false }
 warp = { optional = true, version = "0.3.7", default-features = false }
 
 [dev-dependencies]
-pgrx-tests = { version = "0.16.1" }
+pgrx-tests = { git = "https://github.com/pgcentralfoundation/pgrx.git", rev = "58147f1a5d6168ef36be58200e6e4527cb6cc772", version = "0.19.1" }
 
 [build-dependencies]
 anyhow = { version = "1.0", default-features = false }
@@ -82,7 +79,7 @@ unused-macro-rules = 'warn'
 [lints.rust.unexpected_cfgs]
 level = "warn"
 check-cfg = [
-    'cfg(feature, values("pg13", "pg14", "pg15", "pg16", "pg17", "pg18"))',
+    'cfg(feature, values("pg13", "pg14", "pg15", "pg16", "pg17", "pg18", "pg19"))',
 ]
 
 [lints.clippy]
