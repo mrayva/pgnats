@@ -113,8 +113,8 @@ impl_nats_request! {
     ///
     /// # SQL Usage
     /// ```sql
-    /// -- Simple binary request
-    /// SELECT nats_request_binary('service.call', E'\\x01'::bytea, '5s');
+    /// -- Simple binary request (timeout in milliseconds)
+    /// SELECT nats_request_binary('service.call', E'\\x01'::bytea, 5000);
     /// ```
     binary, Vec<u8>
 }
@@ -132,8 +132,8 @@ impl_nats_request! {
     ///
     /// # SQL Usage
     /// ```sql
-    /// -- Simple text request
-    /// SELECT nats_request_text('api.get', '{"id":42}', '1s');
+    /// -- Simple text request (timeout in milliseconds)
+    /// SELECT nats_request_text('api.get', '{"id":42}', 1000);
     /// ```
     text, String
 }
@@ -151,8 +151,8 @@ impl_nats_request! {
     ///
     /// # SQL Usage
     /// ```sql
-    /// -- Basic JSON request
-    /// SELECT nats_request_json('api.users', '{"action":"get"}'::json, '2s');
+    /// -- Basic JSON request (timeout in milliseconds)
+    /// SELECT nats_request_json('api.users', '{"action":"get"}'::json, 2000);
     /// ```
     json, pgrx::Json
 }
@@ -170,8 +170,8 @@ impl_nats_request! {
     ///
     /// # SQL Usage
     /// ```sql
-    /// -- Simple JSONB request
-    /// SELECT nats_request_jsonb('data.export', '{"format":"parquet"}'::jsonb, '10s');
+    /// -- Simple JSONB request (timeout in milliseconds)
+    /// SELECT nats_request_jsonb('data.export', '{"format":"parquet"}'::jsonb, 10000);
     /// ```
     jsonb, pgrx::JsonB
 }
