@@ -19,14 +19,28 @@ Example (matching a real NYSE trades table with mixed-case columns):
         --verify
 
 That publishes each row's whole tuple, msgpack-encoded, to a subject built
-from that row's own Exchange and Symbol values (e.g. "N.AAPL"), and with
---verify also proves nats_tool can receive and decode every one of them by
-spinning up a consumer, cross-checking its decoded output against
-pg_zerialize's own <format>_to_jsonb decode of the same rows (as an
-unordered multiset -- subjects built from arbitrary, possibly non-unique
-column values can't be used to correlate individual rows back to a source
-identity in the general case, so content, not position, is what's
-verified).
+from that row's own Exchange/Symbol values plus the format as the last
+token (e.g. "N.AAPL.msgpack" - see --no-subject-format-suffix to omit
+it), and with --verify also proves nats_tool can receive and decode every
+one of them, by spinning up a consumer and cross-checking its decoded
+output against pg_zerialize's own <format>_to_jsonb decode of the same
+rows (as an unordered multiset -- subjects built from arbitrary, possibly
+non-unique column values can't be used to correlate individual rows back
+to a source identity in the general case, so content, not position, is
+what's verified).
+
+Streaming, not materializing: --sql is wrapped in a single query (a
+server-side cursor, fetched in batches) that computes each row's payload
+once and both publishes it and (with --verify) records its jsonb
+reference from that same evaluation - nothing about --sql is copied into
+a temp table first, so this scales to a query returning millions of rows
+without duplicating them server-side. The tradeoff: a bad subject-column
+value is only caught at the row it occurs on (see "safety" in
+build_subject_expr()'s docstring below) - rows the server already
+streamed past by then have already been published, since NATS publish
+side effects aren't transactional/rollback-able. If you need a hard
+guarantee that nothing gets published unless the whole result set is
+clean, filter/validate the source data before pointing this at it.
 
 Requires: psycopg (v3) - already available in this environment. Connects
 using standard libpq environment variables (PGHOST/PGPORT/PGUSER/
@@ -52,10 +66,11 @@ FORMATS = ("msgpack", "cbor", "zera", "flexbuffers", "ion", "bson", "beve")
 # NATS subject tokens can't contain whitespace or the wildcard characters
 # '*'/'>' - a column value containing one of those would silently corrupt
 # the subject's token structure downstream (e.g. turn a value into an
-# unintended wildcard subscription match). Caught here, at publish time,
-# rather than discovered later as a confusing "wrong number of messages
-# received" mismatch during --verify.
-BAD_SUBJECT_TOKEN_RE = re.compile(r"[\s*>]")
+# unintended wildcard subscription match). Postgres's ~ operator
+# understands \s in ARE (advanced regex) mode, its default, so this same
+# pattern is pushed server-side as part of the per-row subject expression
+# itself (see build_subject_expr()) rather than checked in Python.
+BAD_SUBJECT_TOKEN_PATTERN = r"[\s*>]"
 
 
 def parse_args():
@@ -75,20 +90,27 @@ def parse_args():
     p.add_argument("--subject-prefix", default="",
                     help="Literal token(s) prepended to every subject, e.g. 'trades' -> "
                          "'trades.N.AAPL'. Omit for no prefix.")
+    p.add_argument("--subject-format-suffix", action=argparse.BooleanOptionalAction, default=True,
+                    help="Append the format name as the last subject token, e.g. "
+                         "'N.AAPL.msgpack' (default: on). Lets consumers subscribe by format "
+                         "(e.g. '*.*.msgpack') when the same subject-columns are published in "
+                         "more than one format across separate runs, without them colliding.")
     p.add_argument("--limit", type=int, default=None,
                     help="Cap the number of rows published (applied to --sql's result). "
                          "Strongly recommended for large tables.")
     p.add_argument("--dsn", default="",
                     help="libpq connection string/URI. Default: read standard PG* env vars, same as psql.")
+    p.add_argument("--progress-every", type=int, default=10000,
+                    help="Print a running count every N published rows, 0 to disable (default: 10000).")
     p.add_argument("--verify", action="store_true",
                     help="After publishing, spin up a nats_tool consumer and cross-check its "
                          "decoded output against pg_zerialize's own decode of the same rows.")
     p.add_argument("--nats-tool", default=os.path.expanduser("~/nats_asio/build/bin/nats_tool"),
                     help="Path to nats_tool (used only with --verify).")
     p.add_argument("--nats-topic", default=None,
-                    help="Override the --verify consumer's subscribe topic. Default: "
-                         "<subject-prefix.><one '*' per subject column, dot-joined> "
-                         "(e.g. 2 subject-columns, no prefix -> '*.*').")
+                    help="Override the --verify consumer's subscribe topic. Default is derived "
+                         "from --subject-prefix/--subject-columns/--subject-format-suffix "
+                         "(e.g. 2 subject-columns, no prefix, format suffix on -> '*.*.msgpack').")
     p.add_argument("--timeout-secs", type=int, default=60,
                     help="Max seconds to wait for the --verify consumer to finish (default: 60).")
     p.add_argument("--connect-wait-secs", type=int, default=15,
@@ -125,26 +147,46 @@ def parse_subject_columns(raw):
     return cols
 
 
-def build_subject_expr(subject_columns, prefix):
-    # COALESCE so a NULL column value produces the literal token "_NULL_"
-    # in the subject instead of making the whole subject expression NULL
-    # (concatenation with NULL is NULL in SQL, which nats_publish_binary
-    # would reject outright rather than silently drop -- fail loud either
-    # way, but this keeps the failure specific to genuinely bad data, not
-    # every row that happens to have a NULL in a subject column).
-    parts = [
-        sql.SQL("COALESCE({}::text, '_NULL_')").format(sql.Identifier(c))
-        for c in subject_columns
-    ]
+def build_subject_expr(subject_columns, prefix, fmt, format_suffix):
+    """Builds the per-row subject expression.
+
+    Safety: each column's value is checked in-line against
+    BAD_SUBJECT_TOKEN_PATTERN and, on a match, deliberately casts an
+    error-describing string to integer - not a real conversion, just the
+    simplest way to make Postgres raise a real, readable ERROR (aborting
+    the query at that row) without a helper function or a separate
+    validation pass. See the module docstring for what that means for
+    rows the server already streamed past by the time it hits a bad one.
+    """
+    parts = []
+    for col in subject_columns:
+        ident = sql.Identifier(col)
+        parts.append(
+            sql.SQL(
+                "CASE WHEN {ident} IS NULL THEN '_NULL_' "
+                "WHEN {ident}::text ~ {pattern} "
+                "THEN ((('bad subject value for column ' || {name} || ': ' || {ident}::text))::integer)::text "
+                "ELSE {ident}::text END"
+            ).format(
+                ident=ident,
+                pattern=sql.Literal(BAD_SUBJECT_TOKEN_PATTERN),
+                name=sql.Literal(col),
+            )
+        )
+    if format_suffix:
+        parts.append(sql.Literal(fmt))
     expr = sql.SQL(" || '.' || ").join(parts)
     if prefix:
         expr = sql.SQL("{} || '.' || ").format(sql.Literal(prefix)) + expr
     return expr
 
 
-def default_topic(subject_columns, prefix):
-    wildcard = ".".join("*" for _ in subject_columns)
-    return f"{prefix}.{wildcard}" if prefix else wildcard
+def default_topic(subject_columns, prefix, fmt, format_suffix):
+    tokens = ["*" for _ in subject_columns]
+    if format_suffix:
+        tokens.append(fmt)
+    topic = ".".join(tokens)
+    return f"{prefix}.{topic}" if prefix else topic
 
 
 def canonical(obj):
@@ -176,6 +218,24 @@ def wait_for_subscribed(log_path, timeout_secs):
     return False
 
 
+def build_stream_query(user_sql, limit, fmt, subject_expr, verify):
+    # payload (row_to_<fmt>) is computed exactly once per row here and
+    # reused below for both the jsonb reference (--verify only) and the
+    # actual publish call, rather than invoking the encoder twice.
+    limit_clause = sql.SQL(" LIMIT {}").format(sql.Literal(limit)) if limit else sql.SQL("")
+    src = sql.SQL("SELECT *, {}(src) AS _e2e_payload FROM ({}) AS src{}").format(
+        sql.Identifier(f"row_to_{fmt}"), sql.SQL(user_sql), limit_clause
+    )
+    publish_col = sql.SQL("nats_publish_binary({}, t._e2e_payload)").format(subject_expr)
+    if verify:
+        select_list = sql.SQL("{}(t._e2e_payload), {}").format(
+            sql.Identifier(f"{fmt}_to_jsonb"), publish_col
+        )
+    else:
+        select_list = publish_col
+    return sql.SQL("SELECT {} FROM ({}) AS t").format(select_list, src)
+
+
 def main():
     args = parse_args()
     fmt = validate_format(args.format)
@@ -186,56 +246,15 @@ def main():
         sys.exit(f"error: --verify given but nats_tool not found/executable at {args.nats_tool} "
                  "(build ~/nats_asio first, or pass --nats-tool)")
 
-    conn = psycopg.connect(args.dsn, autocommit=True)
-    cur = conn.cursor()
-
-    print("== 1. Materializing --sql result ==")
-    limit_clause = sql.SQL(" LIMIT {}").format(sql.Literal(args.limit)) if args.limit else sql.SQL("")
-    cur.execute(
-        sql.SQL("CREATE TEMP TABLE _e2e_src AS {}{}").format(sql.SQL(user_sql), limit_clause)
+    subject_expr = build_subject_expr(
+        subject_columns, args.subject_prefix, fmt, args.subject_format_suffix
     )
-    cur.execute("SELECT count(*) FROM _e2e_src")
-    row_count = cur.fetchone()[0]
-    print(f"  {row_count} row(s)")
-    if row_count == 0:
-        sys.exit("error: --sql produced zero rows, nothing to publish")
+    query = build_stream_query(user_sql, args.limit, fmt, subject_expr, args.verify)
 
-    for col in subject_columns:
-        cur.execute(
-            "SELECT 1 FROM information_schema.columns "
-            "WHERE table_name = '_e2e_src' AND column_name = %s",
-            (col,),
-        )
-        if cur.fetchone() is None:
-            sys.exit(f"error: subject column '{col}' is not present in --sql's result columns")
-
-    # Postgres's ~ operator understands \s in ARE (advanced regex) mode, its
-    # default, so the same pattern the Python side uses to describe this
-    # check can be pushed server-side as a single bounded query instead of
-    # pulling every subject-column value across to check them in Python.
-    col_checks = sql.SQL(" OR ").join(
-        sql.SQL("{}::text ~ {}").format(sql.Identifier(c), sql.Literal(BAD_SUBJECT_TOKEN_RE.pattern))
-        for c in subject_columns
-    )
-    select_cols = sql.SQL(", ").join(sql.Identifier(c) for c in subject_columns)
-    cur.execute(sql.SQL("SELECT {} FROM _e2e_src WHERE {} LIMIT 5").format(select_cols, col_checks))
-    bad_rows = cur.fetchall()
-    if bad_rows:
-        sys.exit(f"error: subject column(s) {subject_columns} contain values with whitespace or "
-                 f"NATS wildcard characters ('*'/'>'), which would corrupt the subject "
-                 f"structure, e.g.: {bad_rows!r}")
-
-    subject_expr = build_subject_expr(subject_columns, args.subject_prefix)
-
-    reference = None
-    if args.verify:
-        print("== 2. Computing reference (pg_zerialize's own decode) ==")
-        ref_query = sql.SQL("SELECT {}({}(_e2e_src)) FROM _e2e_src").format(
-            sql.Identifier(f"{fmt}_to_jsonb"), sql.Identifier(f"row_to_{fmt}")
-        )
-        cur.execute(ref_query)
-        reference = [canonical(row[0]) for row in cur.fetchall()]
-        print(f"  {len(reference)} reference row(s)")
+    # Server-side (named) cursors need an open transaction block for their
+    # whole lifetime, so this can't use autocommit - committed explicitly
+    # once the cursor is done, below.
+    conn = psycopg.connect(args.dsn)
 
     dump_dir = tempfile.mkdtemp(prefix="nats_e2e_")
     dump_path = os.path.join(dump_dir, f"{fmt}.jsonl")
@@ -244,41 +263,58 @@ def main():
 
     try:
         if args.verify:
-            topic = args.nats_topic or default_topic(subject_columns, args.subject_prefix)
-            print(f"== 3. Starting nats_tool consumer (topic={topic!r}) ==")
+            topic = args.nats_topic or default_topic(
+                subject_columns, args.subject_prefix, fmt, args.subject_format_suffix
+            )
+            print(f"== 1. Starting nats_tool consumer (topic={topic!r}) ==")
+            # Row count isn't known ahead of time in a streaming design, so
+            # the consumer can't be told an exact --max_msgs; give it an
+            # effectively-unbounded one and stop it explicitly once the
+            # publish side is done (see below).
             with open(log_path, "w") as log_file:
-                consumer = start_consumer(args.nats_tool, topic, fmt, row_count, dump_path, log_file)
+                consumer = start_consumer(args.nats_tool, topic, fmt, 2**31 - 1, dump_path, log_file)
             if not wait_for_subscribed(log_path, args.connect_wait_secs):
                 print(f"  WARNING: consumer did not confirm subscription within "
                       f"{args.connect_wait_secs}s -- proceeding anyway", file=sys.stderr)
             else:
                 print("  consumer subscribed")
 
-        print(f"== {'4' if args.verify else '2'}. Publishing {row_count} row(s) as {fmt} ==")
-        pub_query = sql.SQL("SELECT nats_publish_binary({}, {}(_e2e_src)) FROM _e2e_src").format(
-            subject_expr, sql.Identifier(f"row_to_{fmt}")
-        )
+        print(f"== {'2' if args.verify else '1'}. Streaming --sql and publishing as {fmt} ==")
+        reference = [] if args.verify else None
+        published = 0
         try:
-            cur.execute(pub_query)
+            with conn.cursor(name="_e2e_cursor") as cur:
+                cur.itersize = 1000
+                cur.execute(query)
+                for row in cur:
+                    if args.verify:
+                        reference.append(canonical(row[0]))
+                    published += 1
+                    if args.progress_every and published % args.progress_every == 0:
+                        print(f"  ...{published} published so far")
         except psycopg.Error as e:
-            sys.exit(f"error: publish failed: {e}")
-        print(f"  published {row_count} message(s)")
+            sys.exit(f"error: publish failed after {published} row(s): {e}")
+        conn.commit()
+        print(f"  published {published} message(s)")
+
+        if published == 0:
+            sys.exit("error: --sql produced zero rows, nothing was published")
 
         if not args.verify:
             return
 
-        # grub mode has no self-exit on --max_msgs: it only auto-unsubscribes
-        # after N messages (nats_asio.hpp's increment_and_check()) and then
-        # keeps running - the only way to stop it is SIGINT/SIGTERM (see the
+        # grub mode has no self-exit: it only auto-unsubscribes after
+        # --max_msgs (nats_asio.hpp's increment_and_check()) and then keeps
+        # running - the only way to stop it is SIGINT/SIGTERM (see the
         # comment at nats_tool.cpp's signal_set setup). That's also what
-        # triggers the dump file's flush-on-clean-exit (its ofstream is only
-        # auto-flushed every 100 messages otherwise - see message_output.hpp's
-        # dump_file_writer). So: give delivery a short settle window (local
-        # NATS delivery to an already-subscribed consumer is sub-second),
-        # then terminate() (SIGTERM, not kill()/SIGKILL) so that teardown -
-        # and the flush it does - actually runs, then wait for the now-clean
-        # exit.
-        print("== 5. Waiting for delivery, then stopping the consumer ==")
+        # triggers the dump file's flush-on-clean-exit (its ofstream is
+        # only auto-flushed every 100 messages otherwise - see
+        # message_output.hpp's dump_file_writer). So: give delivery a
+        # short settle window (local NATS delivery to an already-
+        # subscribed consumer is sub-second), then terminate() (SIGTERM,
+        # not kill()/SIGKILL) so that teardown - and the flush it does -
+        # actually runs, then wait for the now-clean exit.
+        print("== 3. Waiting for delivery, then stopping the consumer ==")
         time.sleep(min(args.timeout_secs, 3))
         consumer.terminate()
         try:
@@ -297,7 +333,7 @@ def main():
                     if line:
                         received.append(canonical(json.loads(line)))
 
-        print("== 6. Comparing ==")
+        print("== 4. Comparing ==")
         print(f"  reference: {len(reference)}, received: {len(received)}")
 
         exp_sorted = sorted(reference)

@@ -151,13 +151,26 @@ for ad hoc testing against real tables), and requires `psycopg` (v3).
 ```
 
 Publishes each row's whole tuple, msgpack-encoded, to a subject built from
-that row's own `Exchange`/`Symbol` values (e.g. `N.AAPL`). `--verify` spins
-up an `nats_tool` consumer and cross-checks its decoded output against
-pg_zerialize's own decode of the same rows, as an unordered multiset
-(subject values built from arbitrary columns aren't necessarily unique per
-row, so content -- not subject -- is what's compared). Run with `--help`
-for the full option list (`--subject-prefix`, `--nats-topic`, `--dsn`,
-timeouts, etc).
+that row's own `Exchange`/`Symbol` values plus the format as the last
+token, e.g. `N.AAPL.msgpack` (omit with `--no-subject-format-suffix`).
+`--verify` spins up an `nats_tool` consumer and cross-checks its decoded
+output against pg_zerialize's own decode of the same rows, as an unordered
+multiset (subject values built from arbitrary columns aren't necessarily
+unique per row, so content -- not subject -- is what's compared). Run with
+`--help` for the full option list (`--subject-prefix`, `--nats-topic`,
+`--dsn`, timeouts, etc).
+
+`--sql` is never materialized into a table: it's wrapped in a single
+streaming query (a server-side cursor, fetched in batches) that computes
+each row's payload once and both publishes it and (with `--verify`)
+records its jsonb reference from that same evaluation, so this scales to
+a query returning millions of rows without copying them server-side
+first. The tradeoff: a subject-column value containing whitespace or a
+NATS wildcard character (`*`/`>`) is only caught at the row it occurs on
+-- rows the server already streamed past by then have already been
+published, since NATS publish isn't transactional. Filter/validate the
+source data first if you need a guarantee that nothing gets published
+unless the whole result set is clean.
 
 ## 🦀 Minimum supported Rust version
 
