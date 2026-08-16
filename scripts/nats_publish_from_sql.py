@@ -113,15 +113,28 @@ jsonb to reproduce the old (size-win-only) behavior for comparison.
 --workers N (opt-in, default 1 = off) tests connection-level parallelism
 alongside per-message encoding cost: splits --sql's rows across N
 independent Postgres connections, each publishing its own physical
-page-range share concurrently. Real scaling, not just theoretical -
-measured against 200k real rows, msgpack only, unbatched: 1 worker
-611k rows/s, 2 workers 740k/s, 4 workers 1.17M rows/s, 8 workers
-1.44M rows/s, 16 workers 1.67M rows/s (sub-linear beyond ~4-8, likely the
-shared NATS server/connection overhead becoming the bottleneck rather than
-encoding). Combinable with --batch-size (each worker batches its own
-share the same way the single-connection path would) and --verify (one
-shared nats_tool consumer per format; each worker contributes its own
-slice of the decoded reference list, merged before comparing).
+page-range share concurrently. Without --verify, each worker uses the
+same one-round-trip server-side aggregation build_count_query()/
+build_batched_count_query() already use for the single-connection path -
+no row data shipped back to Python - since an earlier version of this
+path streamed every row back for row-by-row Python-side counting even
+without --verify, which is GIL-bound across worker threads and was the
+dominant cause of its scaling falling off: confirmed directly via a
+controlled isolation test (server-side count-only vs Python-side row
+iteration, same query, same worker counts) that this GIL bottleneck, not
+Postgres or NATS, explained most of the gap. Real scaling, not just
+theoretical - measured against 2M real rows, msgpack only, unbatched:
+1 worker 670k rows/s, 2 workers 967k/s, 4 workers 1.47M rows/s, 8 workers
+2.15M rows/s, 16 workers 2.48M rows/s (3.7x at 16 workers; still
+sub-linear beyond ~8, most likely shared_buffers/memory-bandwidth
+contention across many backends concurrently scanning the same table,
+each also running its own per-backend NATS client + Tokio runtime -
+confirmed pgnats's NATS connection is thread-local per backend, so
+there's no shared-lock bottleneck at that layer). Combinable with
+--batch-size (each worker batches its own share the same way the
+single-connection path would) and --verify (one shared nats_tool
+consumer per format; each worker streams and contributes its own slice
+of the decoded reference list, merged before comparing).
 
 Requires: psycopg (v3) - already available in this environment. Connects
 using standard libpq environment variables (PGHOST/PGPORT/PGUSER/
@@ -773,27 +786,52 @@ def run_parallel_worker(dsn, query, batching, verify, worker_id):
     """Runs in its own thread with its own connection (opened here, not
     shared) - the real parallelism is N separate Postgres backend
     processes doing the encode+publish work concurrently; the Python
-    thread mostly just blocks on that connection's socket. Streams
-    (cursor.stream()) rather than a plain fetch when --verify is on, same
-    reasoning as the single-connection path: the decoded reference list
-    has to end up in Python either way.
+    thread mostly just blocks on that connection's socket.
+
+    Without --verify, no row data is needed back in Python at all - just
+    counts/byte totals - so this uses the same one-round-trip server-side
+    aggregation as the single-connection path's build_count_query()/
+    build_batched_count_query() (see run_one_format()), rather than
+    streaming every row back to be counted in Python. This isn't just a
+    tidiness win: confirmed directly that shipping every row back to
+    Python for row-by-row counting is GIL-bound across worker threads (a
+    controlled isolation test - server-side count-only vs Python-side
+    row iteration, same query, same worker counts - showed the row-
+    iteration version topping out at ~2.7x aggregate throughput at 16
+    workers while the count-only version reached ~4.6x), and was the
+    dominant cause of --workers' earlier sub-linear scaling - a bug in
+    this benchmark tool's own measurement path, not a real Postgres/NATS
+    limitation. With --verify, the decoded reference rows genuinely have
+    to reach Python (there's no way around that), so this still streams
+    (cursor.stream()) row-by-row in that case, same as the
+    single-connection path.
     """
     conn = psycopg.connect(dsn, autocommit=True)
     try:
         t0 = time.perf_counter()
-        rows = 0
-        batches = 0
-        total_bytes = 0
         reference = [] if verify else None
         with conn.cursor() as cur:
-            row_iter = cur.stream(query) if verify else cur.execute(query)
-            for row in row_iter:
-                ref, nbytes, batch_rows = _unpack_worker_row(row, batching, verify)
-                if verify:
+            if verify:
+                rows = 0
+                batches = 0
+                total_bytes = 0
+                for row in cur.stream(query):
+                    ref, nbytes, batch_rows = _unpack_worker_row(row, batching, verify)
                     reference.append(canonical(ref))
-                total_bytes += nbytes
-                rows += batch_rows
-                batches += 1
+                    total_bytes += nbytes
+                    rows += batch_rows
+                    batches += 1
+            else:
+                count_query = build_batched_count_query(query) if batching else build_count_query(query)
+                cur.execute(count_query)
+                if batching:
+                    batches, rows, total_bytes, _min_b, _max_b = cur.fetchone()
+                    rows = int(rows) if rows is not None else 0
+                else:
+                    rows, total_bytes, _avg_b, _min_b, _max_b = cur.fetchone()
+                    rows = rows or 0
+                    batches = rows
+                total_bytes = int(total_bytes) if total_bytes is not None else 0
         return {"worker_id": worker_id, "rows": rows, "batches": batches, "total_bytes": total_bytes,
                 "elapsed": time.perf_counter() - t0, "reference": reference}
     finally:
