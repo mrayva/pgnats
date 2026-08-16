@@ -118,23 +118,41 @@ same one-round-trip server-side aggregation build_count_query()/
 build_batched_count_query() already use for the single-connection path -
 no row data shipped back to Python - since an earlier version of this
 path streamed every row back for row-by-row Python-side counting even
-without --verify, which is GIL-bound across worker threads and was the
-dominant cause of its scaling falling off: confirmed directly via a
+without --verify, which is GIL-bound across worker threads and was a real
+(now-fixed) cause of its scaling falling off: confirmed directly via a
 controlled isolation test (server-side count-only vs Python-side row
-iteration, same query, same worker counts) that this GIL bottleneck, not
-Postgres or NATS, explained most of the gap. Real scaling, not just
-theoretical - measured against 2M real rows, msgpack only, unbatched:
-1 worker 670k rows/s, 2 workers 967k/s, 4 workers 1.47M rows/s, 8 workers
-2.15M rows/s, 16 workers 2.48M rows/s (3.7x at 16 workers; still
-sub-linear beyond ~8, most likely shared_buffers/memory-bandwidth
-contention across many backends concurrently scanning the same table,
-each also running its own per-backend NATS client + Tokio runtime -
-confirmed pgnats's NATS connection is thread-local per backend, so
-there's no shared-lock bottleneck at that layer). Combinable with
---batch-size (each worker batches its own share the same way the
-single-connection path would) and --verify (one shared nats_tool
-consumer per format; each worker streams and contributes its own slice
-of the decoded reference list, merged before comparing).
+iteration, same query, same worker counts) that this GIL bottleneck
+explained most of an earlier gap. Also chased down a second real
+bottleneck one layer down: pgnats's per-backend NATS connection runs on
+its own thread_local Tokio runtime, which defaulted to one OS worker
+thread per CPU core (25 threads/backend on a 24-core box) - with many
+concurrent backends that's real oversubscription, and was measurably
+causing aggregate throughput to *decline* past ~24 workers. Fixed
+upstream in pgnats (src/ctx.rs, worker_threads(2) instead of the
+per-core default) - see that commit for why new_current_thread() (the
+seemingly obvious fix) was tried first and made things ~9x worse, not
+better.
+
+Real scaling, not just theoretical - measured against real NYSE rows,
+msgpack: unbatched, 2M rows: 1 worker 670k rows/s, 2 workers 967k/s,
+4 workers 1.47M/s, 8 workers 2.15M/s, 16 workers 2.46M/s, continuing
+(post-fix) up to ~3.0M/s around 64 workers before plateauing - the
+individual-row publish() round trip is the limit here, not encoding or
+NATS. Combined with --batch-size (native encoding, 500), 30M rows: the
+real unlock - up to ~7.3M rows/s (90 workers), since batching collapses
+the number of individual publish() calls (and their per-call latency)
+by ~500x while parallelism still scales the reduced call count across
+connections. For scale: raw `nats bench pub` (no Postgres involved) on
+this same server measured a single client at 4.56M msgs/sec (340B
+messages) and 16 clients aggregating 9.1M msgs/sec / 6.2 GiB/sec at
+~25KB messages (matching this pipeline's actual batched payload size) -
+even the best combined result here (--workers 90 --batch-size 500) only
+uses roughly 484MB/s of that, meaning NATS itself is nowhere near
+saturated; Postgres-side per-call/per-row cost is still the real ceiling.
+Combinable with --batch-size (each worker batches its own share the
+same way the single-connection path would) and --verify (one shared
+nats_tool consumer per format; each worker streams and contributes its
+own slice of the decoded reference list, merged before comparing).
 
 Requires: psycopg (v3) - already available in this environment. Connects
 using standard libpq environment variables (PGHOST/PGPORT/PGUSER/
