@@ -110,6 +110,16 @@ smaller - msgpack 1.8x, ion 4.9x (2.2x vs the old jsonb-batched path),
 bson 1.5x, zera 2.0x, beve 2.0x, flexbuffers 2.4x. Pass --batch-encoding
 jsonb to reproduce the old (size-win-only) behavior for comparison.
 
+--workers N (opt-in, default 1 = off) tests connection-level parallelism
+instead of (or, once combinable, alongside) per-message encoding cost:
+splits --sql's rows across N independent Postgres connections, each
+publishing its own physical page-range share concurrently. Real scaling,
+not just theoretical - measured against 200k real rows, msgpack only:
+1 worker 611k rows/s, 2 workers 740k/s, 4 workers 1.17M rows/s, 8 workers
+1.44M rows/s, 16 workers 1.67M rows/s (sub-linear beyond ~4-8, likely the
+shared NATS server/connection overhead becoming the bottleneck rather than
+encoding). Not yet combinable with --batch-size or --verify.
+
 Requires: psycopg (v3) - already available in this environment. Connects
 using standard libpq environment variables (PGHOST/PGPORT/PGUSER/
 PGPASSWORD/PGDATABASE/...), same as psql; override with --dsn if needed.
@@ -124,7 +134,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 import psycopg
 from psycopg import sql
@@ -206,6 +218,17 @@ def parse_args():
                          "*loss* for every format except Ion, since the GROUP BY/jsonb "
                          "construction cost outweighs the encoder-level saving. Requires "
                          "pg_zerialize >= 1.12 for 'native'.")
+    p.add_argument("--workers", type=int, default=1,
+                    help="Split --sql's rows across N parallel SQL connections instead of one "
+                         "(opt-in, default: 1 = off), each publishing its own share "
+                         "concurrently - tests whether publish throughput scales with "
+                         "connection-level parallelism, not just per-message encoding cost. "
+                         "Requires materializing --sql's rows into a throwaway UNLOGGED table "
+                         "first (dropped when the run ends) - --sql has no guaranteed row order "
+                         "on its own, so partitioning it directly across independent connections "
+                         "isn't safe. Rows are then split into N roughly-equal, non-overlapping "
+                         "physical page (ctid) ranges, one per worker. Not yet combinable with "
+                         "--batch-size or --verify.")
     p.add_argument("--dsn", default="",
                     help="libpq connection string/URI. Default: read standard PG* env vars, same as psql.")
     p.add_argument("--progress-every", type=int, default=10000,
@@ -271,8 +294,15 @@ def parse_subject_columns(raw):
     return cols
 
 
-def build_subject_expr(subject_columns, prefix, fmt, format_suffix, on_bad_value):
+def build_subject_expr(subject_columns, prefix, fmt, format_suffix, on_bad_value, composite_column=None):
     """Builds the per-row subject expression.
+
+    `composite_column`, when given, addresses each subject column as a
+    field of that composite column (e.g. "(_e2e_row).\"Exchange\"")
+    instead of a bare top-level column reference - used by the --workers
+    parallel-publish path, whose per-worker query only has the whole
+    original row available as a single composite column, not as
+    individually-projected columns (see materialize_partitioned()).
 
     Safety, one of two modes (--on-bad-subject-value):
 
@@ -296,7 +326,10 @@ def build_subject_expr(subject_columns, prefix, fmt, format_suffix, on_bad_value
     """
     parts = []
     for col in subject_columns:
-        ident = sql.Identifier(col)
+        if composite_column:
+            ident = sql.SQL("({}).{}").format(sql.Identifier(composite_column), sql.Identifier(col))
+        else:
+            ident = sql.Identifier(col)
         if on_bad_value == "normalize":
             parts.append(
                 sql.SQL(
@@ -618,6 +651,164 @@ def fmt_bytes(n):
     return f"{n:,.0f}TB"
 
 
+def materialize_partitioned(conn, user_sql, limit, table_name):
+    """Materializes --sql (capped at `limit` rows) into a throwaway UNLOGGED
+    table, an exact 1:1 flat copy of --sql's own columns (same names,
+    same types) - deliberately *not* wrapped into a single composite
+    column: CREATE TABLE AS can't store a column of pseudo-type "record"
+    (confirmed directly - "column has pseudo-type record" - since record
+    has no fixed on-disk representation outside one query's execution),
+    which a bare `src AS whole_row` projection produces whenever src is a
+    derived subquery rather than a real table scan.
+
+    Needed at all (rather than partitioning --sql directly) so --workers'
+    independently-opened connections can each claim a disjoint, gap-free,
+    overlap-free slice of the same row set: --sql has no guaranteed row
+    order on its own (the same issue build_native_columnar_publish_query's
+    docstring notes for LIMIT), so two separate executions of the same
+    unordered query aren't guaranteed to agree on which rows go where.
+    Partitioning is done by physical ctid page range afterwards (see
+    ctid_page_bounds()) rather than an injected row-id column, so the
+    materialized table's columns exactly match --sql's, with nothing to
+    strip back out before serializing. UNLOGGED (skips WAL) since this is
+    a disposable benchmark artifact, dropped by the caller when the run
+    ends.
+    """
+    limit_clause = sql.SQL(" LIMIT {}").format(sql.Literal(limit)) if limit else sql.SQL("")
+    query = sql.SQL(
+        "CREATE UNLOGGED TABLE {table} AS SELECT * FROM ({user_sql}) AS s0{limit}"
+    ).format(table=sql.Identifier(table_name), user_sql=sql.SQL(user_sql), limit=limit_clause)
+    with conn.cursor() as cur:
+        cur.execute(query)
+        cur.execute(sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier(table_name)))
+        return cur.fetchone()[0]
+
+
+def ctid_page_bounds(conn, table_name, workers):
+    """Splits the materialized table's block range into `workers` roughly
+    equal, non-overlapping, gap-free page ranges - pg_relation_size() is
+    exact immediately after CREATE TABLE AS (no ANALYZE/stats needed,
+    unlike relpages). Returns a list of (lo_page, hi_page_or_None) tuples,
+    one per worker, in worker-id order; the last worker's upper bound is
+    None (open-ended) so it also catches anything at/after the final
+    computed boundary.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            sql.SQL("SELECT pg_relation_size({t}) / current_setting('block_size')::bigint").format(
+                t=sql.Literal(table_name)
+            )
+        )
+        pages = cur.fetchone()[0] or 0
+    pages = max(pages, 1)
+    bounds = []
+    for i in range(workers):
+        lo = (i * pages) // workers
+        hi = ((i + 1) * pages) // workers
+        bounds.append((lo, hi if i < workers - 1 else None))
+    return bounds
+
+
+def build_parallel_worker_query(table_name, fmt, subject_expr, page_lo, page_hi):
+    # payload (row_to_<fmt>) computed once and reused for both the byte
+    # count and the publish call, same reasoning as build_publish_query().
+    ctid_filter = sql.SQL("t.ctid >= {lo}::text::tid").format(lo=sql.Literal(f"({page_lo},0)"))
+    if page_hi is not None:
+        ctid_filter = sql.SQL("{lo} AND t.ctid < {hi}::text::tid").format(
+            lo=ctid_filter, hi=sql.Literal(f"({page_hi},0)")
+        )
+    return sql.SQL(
+        "SELECT octet_length(payload) AS _e2e_bytes, nats_publish_binary({subj}, payload) AS _e2e_pub "
+        "FROM (SELECT *, {row_to_fmt}(t) AS payload FROM {table} t WHERE {ctid_filter}) AS s"
+    ).format(
+        subj=subject_expr,
+        row_to_fmt=sql.Identifier(f"row_to_{fmt}"),
+        table=sql.Identifier(table_name),
+        ctid_filter=ctid_filter,
+    )
+
+
+def run_parallel_worker(dsn, table_name, fmt, subject_expr, worker_id, page_lo, page_hi):
+    """Runs in its own thread with its own connection (opened here, not
+    shared) - the real parallelism is N separate Postgres backend
+    processes doing the encode+publish work concurrently; the Python
+    thread mostly just blocks on that connection's socket.
+    """
+    conn = psycopg.connect(dsn, autocommit=True)
+    try:
+        query = build_parallel_worker_query(table_name, fmt, subject_expr, page_lo, page_hi)
+        t0 = time.perf_counter()
+        rows = 0
+        total_bytes = 0
+        with conn.cursor() as cur:
+            cur.execute(query)
+            for nbytes, _pub in cur:
+                rows += 1
+                total_bytes += nbytes
+        return {"worker_id": worker_id, "rows": rows, "total_bytes": total_bytes,
+                "elapsed": time.perf_counter() - t0}
+    finally:
+        conn.close()
+
+
+def run_one_format_parallel(conn, args, fmt, subject_columns):
+    """--workers > 1 path: materializes --sql once (see
+    materialize_partitioned()), then fans out N independent connections
+    each publishing its own disjoint share concurrently, timed as one
+    wall-clock window (not summed per-worker time) so the result reflects
+    real elapsed-time throughput, the way a caller waiting on the whole
+    run would experience it.
+    """
+    metrics = {"format": fmt, "error": None, "workers": args.workers}
+    table_name = f"nats_bench_parallel_{uuid.uuid4().hex[:12]}"
+    subject_expr = build_subject_expr(
+        subject_columns, args.subject_prefix, fmt, args.subject_format_suffix, args.on_bad_subject_value
+    )
+    try:
+        print(f"== [{fmt}] 1. Materializing --sql's rows ({args.workers} workers) ==")
+        total_rows = materialize_partitioned(conn, args.sql_stripped, args.limit, table_name)
+        bounds = ctid_page_bounds(conn, table_name, args.workers)
+        print(f"  {total_rows} row(s) materialized, partitioning by physical page range across "
+              f"{args.workers} worker(s)")
+
+        print(f"== [{fmt}] 2. Publishing ({args.workers} parallel connections) ==")
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futures = [
+                ex.submit(run_parallel_worker, args.dsn, table_name, fmt, subject_expr, i, lo, hi)
+                for i, (lo, hi) in enumerate(bounds)
+            ]
+            worker_results = [f.result() for f in futures]
+        wall_secs = time.perf_counter() - t0
+
+        for w in sorted(worker_results, key=lambda w: w["worker_id"]):
+            print(f"  worker {w['worker_id']}: {w['rows']} row(s) in {fmt_secs(w['elapsed'])} "
+                  f"({fmt_rate(w['rows'], w['elapsed'])})")
+
+        published = sum(w["rows"] for w in worker_results)
+        total_bytes = sum(w["total_bytes"] for w in worker_results)
+        print(f"  published {published} row(s) across {args.workers} worker(s) in {fmt_secs(wall_secs)} "
+              f"({fmt_rate(published, wall_secs)} aggregate, {fmt_bytes(total_bytes)} total)")
+
+        metrics.update(
+            rows=published, batches=published, publish_secs=wall_secs,
+            total_bytes=total_bytes,
+            avg_bytes=(total_bytes / published) if published else None,
+        )
+        if published != total_rows:
+            metrics["error"] = (f"expected {total_rows} row(s) across all workers, published "
+                                 f"{published} (partitioning bug or a worker failed)")
+        elif published == 0:
+            metrics["error"] = "--sql produced zero rows, nothing was published"
+        return metrics
+    except psycopg.Error as e:
+        metrics["error"] = f"publish failed: {e}"
+        return metrics
+    finally:
+        with conn.cursor() as cur:
+            cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(table_name)))
+
+
 def run_one_format(conn, args, fmt, subject_columns, all_columns):
     """Publishes --sql once, encoded as `fmt`, optionally verifying via
     nats_tool. Never raises for an expected failure mode (bad SQL, bad
@@ -628,6 +819,9 @@ def run_one_format(conn, args, fmt, subject_columns, all_columns):
     `all_columns` is only used when --batch-size > 1 (introspected once in
     main(), not per format - the column list doesn't depend on fmt).
     """
+    if args.workers > 1:
+        return run_one_format_parallel(conn, args, fmt, subject_columns)
+
     metrics = {"format": fmt, "error": None}
     batching = args.batch_size > 1
     subject_expr = build_subject_expr(
@@ -868,6 +1062,12 @@ def main():
                  "(each format needs its own topic to avoid collisions)")
     if args.batch_size < 1:
         sys.exit("error: --batch-size must be >= 1")
+    if args.workers < 1:
+        sys.exit("error: --workers must be >= 1")
+    if args.workers > 1 and args.batch_size > 1:
+        sys.exit("error: --workers > 1 is not yet combinable with --batch-size > 1")
+    if args.workers > 1 and args.verify:
+        sys.exit("error: --workers > 1 is not yet combinable with --verify")
 
     conn = psycopg.connect(args.dsn, autocommit=True)
 
