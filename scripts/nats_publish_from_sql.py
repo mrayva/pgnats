@@ -111,14 +111,17 @@ bson 1.5x, zera 2.0x, beve 2.0x, flexbuffers 2.4x. Pass --batch-encoding
 jsonb to reproduce the old (size-win-only) behavior for comparison.
 
 --workers N (opt-in, default 1 = off) tests connection-level parallelism
-instead of (or, once combinable, alongside) per-message encoding cost:
-splits --sql's rows across N independent Postgres connections, each
-publishing its own physical page-range share concurrently. Real scaling,
-not just theoretical - measured against 200k real rows, msgpack only:
-1 worker 611k rows/s, 2 workers 740k/s, 4 workers 1.17M rows/s, 8 workers
+alongside per-message encoding cost: splits --sql's rows across N
+independent Postgres connections, each publishing its own physical
+page-range share concurrently. Real scaling, not just theoretical -
+measured against 200k real rows, msgpack only, unbatched: 1 worker
+611k rows/s, 2 workers 740k/s, 4 workers 1.17M rows/s, 8 workers
 1.44M rows/s, 16 workers 1.67M rows/s (sub-linear beyond ~4-8, likely the
 shared NATS server/connection overhead becoming the bottleneck rather than
-encoding). Not yet combinable with --batch-size or --verify.
+encoding). Combinable with --batch-size (each worker batches its own
+share the same way the single-connection path would) and --verify (one
+shared nats_tool consumer per format; each worker contributes its own
+slice of the decoded reference list, merged before comparing).
 
 Requires: psycopg (v3) - already available in this environment. Connects
 using standard libpq environment variables (PGHOST/PGPORT/PGUSER/
@@ -227,8 +230,10 @@ def parse_args():
                          "first (dropped when the run ends) - --sql has no guaranteed row order "
                          "on its own, so partitioning it directly across independent connections "
                          "isn't safe. Rows are then split into N roughly-equal, non-overlapping "
-                         "physical page (ctid) ranges, one per worker. Not yet combinable with "
-                         "--batch-size or --verify.")
+                         "physical page (ctid) ranges, one per worker. Combinable with "
+                         "--batch-size (each worker batches its own share) and --verify (one "
+                         "shared consumer per format; each worker's decoded reference rows are "
+                         "merged before comparing).")
     p.add_argument("--dsn", default="",
                     help="libpq connection string/URI. Default: read standard PG* env vars, same as psql.")
     p.add_argument("--progress-every", type=int, default=10000,
@@ -709,61 +714,114 @@ def ctid_page_bounds(conn, table_name, workers):
     return bounds
 
 
-def build_parallel_worker_query(table_name, fmt, subject_expr, page_lo, page_hi):
-    # payload (row_to_<fmt>) computed once and reused for both the byte
-    # count and the publish call, same reasoning as build_publish_query().
+def build_worker_source_sql(conn, table_name, page_lo, page_hi):
+    """Renders (to text, via psycopg's own identifier/literal quoting) the
+    ctid-bounded slice of the materialized table that one worker owns -
+    "SELECT * FROM <table> t WHERE t.ctid >= ... [AND t.ctid < ...]" -
+    ready to plug into build_publish_query()/build_batched_publish_query()/
+    build_native_columnar_publish_query() as their `user_sql` argument,
+    exactly the same shape as the top-level --sql string those already
+    accept. Rendering to text once up front (rather than composing
+    sql.SQL(user_sql) around a Composed object) keeps the per-worker query
+    construction identical to the single-connection path's, so batching
+    logic doesn't need a parallel-aware variant.
+    """
     ctid_filter = sql.SQL("t.ctid >= {lo}::text::tid").format(lo=sql.Literal(f"({page_lo},0)"))
     if page_hi is not None:
         ctid_filter = sql.SQL("{lo} AND t.ctid < {hi}::text::tid").format(
             lo=ctid_filter, hi=sql.Literal(f"({page_hi},0)")
         )
-    return sql.SQL(
-        "SELECT octet_length(payload) AS _e2e_bytes, nats_publish_binary({subj}, payload) AS _e2e_pub "
-        "FROM (SELECT *, {row_to_fmt}(t) AS payload FROM {table} t WHERE {ctid_filter}) AS s"
-    ).format(
-        subj=subject_expr,
-        row_to_fmt=sql.Identifier(f"row_to_{fmt}"),
-        table=sql.Identifier(table_name),
-        ctid_filter=ctid_filter,
+    composed = sql.SQL("SELECT * FROM {table} t WHERE {filter}").format(
+        table=sql.Identifier(table_name), filter=ctid_filter
     )
+    return composed.as_string(conn)
 
 
-def run_parallel_worker(dsn, table_name, fmt, subject_expr, worker_id, page_lo, page_hi):
+def build_worker_publish_query(conn, args, fmt, subject_columns, subject_expr, all_columns,
+                                table_name, page_lo, page_hi, batching, verify):
+    worker_sql = build_worker_source_sql(conn, table_name, page_lo, page_hi)
+    if batching and args.batch_encoding == "native":
+        return build_native_columnar_publish_query(
+            worker_sql, None, fmt, subject_columns, subject_expr, args.batch_size, verify
+        )
+    if batching:
+        return build_batched_publish_query(
+            worker_sql, None, fmt, subject_columns, all_columns, subject_expr, args.batch_size, verify
+        )
+    return build_publish_query(worker_sql, None, fmt, subject_expr, verify)
+
+
+def _unpack_worker_row(row, batching, verify):
+    """The worker query's column shape varies with (batching, verify) -
+    (ref?, bytes, batch_rows?, _pub) - see build_publish_query()/
+    build_batched_publish_query()/build_native_columnar_publish_query()'s
+    own `cols` construction, which this mirrors positionally rather than
+    by name (psycopg rows are plain tuples).
+    """
+    idx = 0
+    ref = None
+    if verify:
+        ref = row[idx]
+        idx += 1
+    nbytes = row[idx]
+    idx += 1
+    batch_rows = row[idx] if batching else 1
+    return ref, nbytes, batch_rows
+
+
+def run_parallel_worker(dsn, query, batching, verify, worker_id):
     """Runs in its own thread with its own connection (opened here, not
     shared) - the real parallelism is N separate Postgres backend
     processes doing the encode+publish work concurrently; the Python
-    thread mostly just blocks on that connection's socket.
+    thread mostly just blocks on that connection's socket. Streams
+    (cursor.stream()) rather than a plain fetch when --verify is on, same
+    reasoning as the single-connection path: the decoded reference list
+    has to end up in Python either way.
     """
     conn = psycopg.connect(dsn, autocommit=True)
     try:
-        query = build_parallel_worker_query(table_name, fmt, subject_expr, page_lo, page_hi)
         t0 = time.perf_counter()
         rows = 0
+        batches = 0
         total_bytes = 0
+        reference = [] if verify else None
         with conn.cursor() as cur:
-            cur.execute(query)
-            for nbytes, _pub in cur:
-                rows += 1
+            row_iter = cur.stream(query) if verify else cur.execute(query)
+            for row in row_iter:
+                ref, nbytes, batch_rows = _unpack_worker_row(row, batching, verify)
+                if verify:
+                    reference.append(canonical(ref))
                 total_bytes += nbytes
-        return {"worker_id": worker_id, "rows": rows, "total_bytes": total_bytes,
-                "elapsed": time.perf_counter() - t0}
+                rows += batch_rows
+                batches += 1
+        return {"worker_id": worker_id, "rows": rows, "batches": batches, "total_bytes": total_bytes,
+                "elapsed": time.perf_counter() - t0, "reference": reference}
     finally:
         conn.close()
 
 
-def run_one_format_parallel(conn, args, fmt, subject_columns):
+def run_one_format_parallel(conn, args, fmt, subject_columns, all_columns):
     """--workers > 1 path: materializes --sql once (see
     materialize_partitioned()), then fans out N independent connections
-    each publishing its own disjoint share concurrently, timed as one
-    wall-clock window (not summed per-worker time) so the result reflects
-    real elapsed-time throughput, the way a caller waiting on the whole
-    run would experience it.
+    each publishing its own disjoint physical-page-range share
+    concurrently, timed as one wall-clock window (not summed per-worker
+    time) so the result reflects real elapsed-time throughput, the way a
+    caller waiting on the whole run would experience it. Combinable with
+    --batch-size (each worker runs the same batched/columnar query the
+    single-connection path would, just restricted to its own slice) and
+    --verify (one shared nats_tool consumer per format, same as the
+    single-connection path; each worker streams and contributes its own
+    slice of the decoded reference list, merged before comparing).
     """
     metrics = {"format": fmt, "error": None, "workers": args.workers}
+    batching = args.batch_size > 1
     table_name = f"nats_bench_parallel_{uuid.uuid4().hex[:12]}"
     subject_expr = build_subject_expr(
         subject_columns, args.subject_prefix, fmt, args.subject_format_suffix, args.on_bad_subject_value
     )
+
+    dump_dir = dump_path = log_path = None
+    consumer = None
     try:
         print(f"== [{fmt}] 1. Materializing --sql's rows ({args.workers} workers) ==")
         total_rows = materialize_partitioned(conn, args.sql_stripped, args.limit, table_name)
@@ -771,12 +829,37 @@ def run_one_format_parallel(conn, args, fmt, subject_columns):
         print(f"  {total_rows} row(s) materialized, partitioning by physical page range across "
               f"{args.workers} worker(s)")
 
-        print(f"== [{fmt}] 2. Publishing ({args.workers} parallel connections) ==")
+        step = 2
+        if args.verify:
+            dump_dir = tempfile.mkdtemp(prefix=f"nats_e2e_{fmt}_")
+            dump_path = os.path.join(dump_dir, f"{fmt}.jsonl")
+            log_path = os.path.join(dump_dir, f"{fmt}.log")
+            topic = args.nats_topic or default_topic(
+                subject_columns, args.subject_prefix, fmt, args.subject_format_suffix
+            )
+            print(f"== [{fmt}] {step}. Starting nats_tool consumer (topic={topic!r}) ==")
+            step += 1
+            with open(log_path, "w") as log_file:
+                consumer = start_consumer(args.nats_tool, topic, fmt, dump_path, log_file)
+            if not wait_for_subscribed(log_path, args.connect_wait_secs):
+                print(f"  WARNING: consumer did not confirm subscription within "
+                      f"{args.connect_wait_secs}s -- proceeding anyway", file=sys.stderr)
+            else:
+                print("  consumer subscribed")
+
+        encoding_note = f", {args.batch_encoding} batch encoding" if batching else ""
+        print(f"== [{fmt}] {step}. Publishing ({args.workers} parallel connections{encoding_note}) ==")
+        step += 1
+        worker_queries = [
+            build_worker_publish_query(conn, args, fmt, subject_columns, subject_expr, all_columns,
+                                        table_name, lo, hi, batching, args.verify)
+            for lo, hi in bounds
+        ]
         t0 = time.perf_counter()
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             futures = [
-                ex.submit(run_parallel_worker, args.dsn, table_name, fmt, subject_expr, i, lo, hi)
-                for i, (lo, hi) in enumerate(bounds)
+                ex.submit(run_parallel_worker, args.dsn, q, batching, args.verify, i)
+                for i, q in enumerate(worker_queries)
             ]
             worker_results = [f.result() for f in futures]
         wall_secs = time.perf_counter() - t0
@@ -786,20 +869,89 @@ def run_one_format_parallel(conn, args, fmt, subject_columns):
                   f"({fmt_rate(w['rows'], w['elapsed'])})")
 
         published = sum(w["rows"] for w in worker_results)
+        batches = sum(w["batches"] for w in worker_results)
         total_bytes = sum(w["total_bytes"] for w in worker_results)
-        print(f"  published {published} row(s) across {args.workers} worker(s) in {fmt_secs(wall_secs)} "
-              f"({fmt_rate(published, wall_secs)} aggregate, {fmt_bytes(total_bytes)} total)")
+        batch_note = f" as {batches} batch(es), {args.batch_encoding} encoding" if batching else ""
+        print(f"  published {published} row(s){batch_note} across {args.workers} worker(s) in "
+              f"{fmt_secs(wall_secs)} ({fmt_rate(published, wall_secs)} aggregate, {fmt_bytes(total_bytes)} total)")
 
         metrics.update(
-            rows=published, batches=published, publish_secs=wall_secs,
+            rows=published, batches=batches, publish_secs=wall_secs,
             total_bytes=total_bytes,
             avg_bytes=(total_bytes / published) if published else None,
+            batch_encoding=(args.batch_encoding if batching else None),
         )
         if published != total_rows:
             metrics["error"] = (f"expected {total_rows} row(s) across all workers, published "
                                  f"{published} (partitioning bug or a worker failed)")
-        elif published == 0:
+            return metrics
+        if published == 0:
             metrics["error"] = "--sql produced zero rows, nothing was published"
+            return metrics
+
+        if not args.verify:
+            return metrics
+
+        print(f"== [{fmt}] {step}. Waiting for delivery ==")
+        step += 1
+        # nats_tool's own stats count messages (batches), not rows.
+        received_by_stats, receive_secs = wait_for_received_count(log_path, batches, args.timeout_secs)
+        metrics["receive_secs"] = receive_secs
+        if received_by_stats < batches:
+            print(f"  WARNING: only observed {received_by_stats}/{batches} via consumer "
+                  f"stats within {args.timeout_secs}s -- proceeding to compare anyway",
+                  file=sys.stderr)
+        else:
+            print(f"  all {batches} batch(es) observed received in {fmt_secs(receive_secs)} "
+                  f"({fmt_rate(published, receive_secs)})")
+
+        # Same shutdown reasoning as the single-connection path: grub mode
+        # never self-exits, and SIGTERM (not kill()) is what triggers the
+        # dump file's flush-on-clean-exit.
+        consumer.terminate()
+        try:
+            consumer.wait(timeout=args.timeout_secs)
+        except subprocess.TimeoutExpired:
+            consumer.kill()
+            consumer.wait(timeout=5)
+            print(f"  WARNING: consumer did not exit cleanly within {args.timeout_secs}s "
+                  "after SIGTERM (force-killed) -- its dump file may be incomplete", file=sys.stderr)
+
+        reference = []
+        for w in worker_results:
+            reference.extend(w["reference"])
+        received = []
+        if os.path.exists(dump_path):
+            with open(dump_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        received.append(canonical(json.loads(line)))
+
+        unit = "batch(es)" if batching else "row(s)"
+        print(f"== [{fmt}] {step}. Comparing ==")
+        print(f"  reference: {len(reference)} {unit}, received: {len(received)} {unit}")
+
+        exp_sorted = sorted(reference)
+        act_sorted = sorted(received)
+        if exp_sorted == act_sorted:
+            print(f"  PASS: all {len(reference)} {unit} ({published} row(s)) received and "
+                  "decoded correctly (unordered content match)")
+            metrics["verify_result"] = "PASS"
+            return metrics
+
+        exp_counts = Counter(reference)
+        act_counts = Counter(received)
+        missing = exp_counts - act_counts
+        extra = act_counts - exp_counts
+        print(f"  FAIL: {sum(missing.values())} {unit} missing/mismatched, "
+              f"{sum(extra.values())} unexpected {unit} received")
+        for i, s in enumerate(list(missing.elements())[:3]):
+            print(f"    missing[{i}]: {s[:300]}")
+        for i, s in enumerate(list(extra.elements())[:3]):
+            print(f"    extra[{i}]:   {s[:300]}")
+        metrics["verify_result"] = "FAIL"
+        metrics["error"] = f"{sum(missing.values())} missing, {sum(extra.values())} unexpected"
         return metrics
     except psycopg.Error as e:
         metrics["error"] = f"publish failed: {e}"
@@ -807,6 +959,13 @@ def run_one_format_parallel(conn, args, fmt, subject_columns):
     finally:
         with conn.cursor() as cur:
             cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(table_name)))
+        if consumer and consumer.poll() is None:
+            consumer.kill()
+        if dump_dir:
+            if args.keep_dump:
+                print(f"  (dump kept at {dump_dir})")
+            else:
+                shutil.rmtree(dump_dir, ignore_errors=True)
 
 
 def run_one_format(conn, args, fmt, subject_columns, all_columns):
@@ -820,7 +979,7 @@ def run_one_format(conn, args, fmt, subject_columns, all_columns):
     main(), not per format - the column list doesn't depend on fmt).
     """
     if args.workers > 1:
-        return run_one_format_parallel(conn, args, fmt, subject_columns)
+        return run_one_format_parallel(conn, args, fmt, subject_columns, all_columns)
 
     metrics = {"format": fmt, "error": None}
     batching = args.batch_size > 1
@@ -1064,10 +1223,6 @@ def main():
         sys.exit("error: --batch-size must be >= 1")
     if args.workers < 1:
         sys.exit("error: --workers must be >= 1")
-    if args.workers > 1 and args.batch_size > 1:
-        sys.exit("error: --workers > 1 is not yet combinable with --batch-size > 1")
-    if args.workers > 1 and args.verify:
-        sys.exit("error: --workers > 1 is not yet combinable with --verify")
 
     conn = psycopg.connect(args.dsn, autocommit=True)
 
