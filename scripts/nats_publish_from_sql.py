@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
 """Publishes the result of an arbitrary SQL query to NATS, one message per
 row, encoded with a chosen pg_zerialize binary format, with the subject
-built from the per-row values of chosen columns.
+built from the per-row values of chosen columns. Optionally does this for
+every format in one run and prints a performance comparison across them.
 
 Unlike zerialize_e2e_test.sh/.sql (a fixed regression fixture wired into
 CI, with deliberately crafted edge-case rows), this is a general-purpose
 tool for ad hoc testing against any table/view/query: point it at a real
-table, pick the columns that should form the subject, pick a format, and
-it publishes every row.
+table, pick the columns that should form the subject, pick one or more
+formats, and it publishes every row.
 
-Example (matching a real NYSE trades table with mixed-case columns):
+Example (matching a real NYSE trades table with mixed-case columns),
+benchmarking all 7 formats against the same query in one run:
 
     ./nats_publish_from_sql.py \\
         --sql 'SELECT * FROM nyse_eqy_us_all_trade_20260105' \\
         --subject-columns 'Exchange,Symbol' \\
-        --format msgpack \\
-        --limit 1000 \\
+        --format all \\
+        --limit 100000 \\
         --verify
 
-That publishes each row's whole tuple, msgpack-encoded, to a subject built
-from that row's own Exchange/Symbol values plus the format as the last
-token (e.g. "N.AAPL.msgpack" - see --no-subject-format-suffix to omit
-it), and with --verify also proves nats_tool can receive and decode every
-one of them, by spinning up a consumer and cross-checking its decoded
-output against pg_zerialize's own <format>_to_jsonb decode of the same
-rows (as an unordered multiset -- subjects built from arbitrary, possibly
-non-unique column values can't be used to correlate individual rows back
-to a source identity in the general case, so content, not position, is
-what's verified).
+That publishes each row's whole tuple, encoded per format, to a subject
+built from that row's own Exchange/Symbol values plus the format as the
+last token (e.g. "N.AAPL.msgpack" - see --no-subject-format-suffix to
+omit it), once per requested format. With --verify, each format's run
+also proves nats_tool can receive and decode every one of its messages,
+by spinning up a consumer and cross-checking its decoded output against
+pg_zerialize's own <format>_to_jsonb decode of the same rows (as an
+unordered multiset -- subjects built from arbitrary, possibly non-unique
+column values can't be used to correlate individual rows back to a
+source identity in the general case, so content, not position, is what's
+verified) -- and timing how long that took, for a throughput comparison
+across formats.
 
 Streaming, not materializing: --sql is wrapped in a single query that
 computes each row's payload once (row_to_<fmt>) and both publishes it and
@@ -38,16 +42,18 @@ How that query is run differs by mode, since only --verify actually needs
 row data back in Python:
 
   - Without --verify: one plain execute() wrapping the whole thing in
-    SELECT count(*) FROM (...) - Postgres does the counting, this script
-    never touches a row. Fast and simple, but no progress feedback while
-    it runs, and a failure partway through can't report how many rows had
+    SELECT count(*), sum/avg/min/max(payload size) FROM (...) - Postgres
+    does the counting and the payload-size aggregation, this script never
+    touches a row. Fast and simple, but no progress feedback while it
+    runs, and a failure partway through can't report how many rows had
     already published by then (only that some number of the earlier ones
     did - NATS publish is not transactional, see below).
   - With --verify: fetched row-by-row via psycopg's cursor.stream()
     (libpq single-row mode - no real server-side DECLARE CURSOR, no
     held-open transaction), since the reference list has to end up in
     Python either way for the comparison. This is also what
-    --progress-every reports against.
+    --progress-every reports against, and where payload-size stats are
+    accumulated in Python instead of via a separate query.
 
 The tradeoff either way: a bad subject-column value is only caught at the
 row it occurs on (see "safety" in build_subject_expr()'s docstring below)
@@ -87,6 +93,8 @@ FORMATS = ("msgpack", "cbor", "zera", "flexbuffers", "ion", "bson", "beve")
 # itself (see build_subject_expr()) rather than checked in Python.
 BAD_SUBJECT_TOKEN_PATTERN = r"[\s*>]"
 
+STATS_LINE_RE = re.compile(r"Stats: (\d+) events/sec")
+
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -101,15 +109,18 @@ def parse_args():
                          "Each row's subject is these columns' own values, dot-joined, "
                          "in the given order (e.g. 'Exchange,Symbol' -> subject 'N.AAPL').")
     p.add_argument("--format", required=True,
-                    help=f"pg_zerialize binary format, case-insensitive. One of: {', '.join(FORMATS)}")
+                    help="Comma-separated pg_zerialize binary format(s), case-insensitive, or "
+                         f"'all' for every one of: {', '.join(FORMATS)}. More than one runs "
+                         "each format in turn against the same --sql and prints a performance "
+                         "comparison at the end.")
     p.add_argument("--subject-prefix", default="",
                     help="Literal token(s) prepended to every subject, e.g. 'trades' -> "
                          "'trades.N.AAPL'. Omit for no prefix.")
     p.add_argument("--subject-format-suffix", action=argparse.BooleanOptionalAction, default=True,
                     help="Append the format name as the last subject token, e.g. "
                          "'N.AAPL.msgpack' (default: on). Lets consumers subscribe by format "
-                         "(e.g. '*.*.msgpack') when the same subject-columns are published in "
-                         "more than one format across separate runs, without them colliding.")
+                         "(e.g. '*.*.msgpack'), and is what keeps multiple formats run via "
+                         "--format from colliding on the same subjects.")
     p.add_argument("--limit", type=int, default=None,
                     help="Cap the number of rows published (applied to --sql's result). "
                          "Strongly recommended for large tables.")
@@ -120,29 +131,43 @@ def parse_args():
                          "10000). Only applies with --verify: without it, publishing is a "
                          "single statement with no row-by-row visibility into progress.")
     p.add_argument("--verify", action="store_true",
-                    help="After publishing, spin up a nats_tool consumer and cross-check its "
-                         "decoded output against pg_zerialize's own decode of the same rows.")
+                    help="After publishing, spin up a nats_tool consumer, cross-check its "
+                         "decoded output against pg_zerialize's own decode of the same rows, "
+                         "and time how long full delivery took.")
     p.add_argument("--nats-tool", default=os.path.expanduser("~/nats_asio/build/bin/nats_tool"),
                     help="Path to nats_tool (used only with --verify).")
     p.add_argument("--nats-topic", default=None,
-                    help="Override the --verify consumer's subscribe topic. Default is derived "
-                         "from --subject-prefix/--subject-columns/--subject-format-suffix "
-                         "(e.g. 2 subject-columns, no prefix, format suffix on -> '*.*.msgpack').")
+                    help="Override the --verify consumer's subscribe topic (only meaningful "
+                         "with a single --format). Default is derived from --subject-prefix/"
+                         "--subject-columns/--subject-format-suffix per format.")
     p.add_argument("--timeout-secs", type=int, default=60,
-                    help="Max seconds to wait for the --verify consumer to finish (default: 60).")
+                    help="Max seconds to wait for --verify delivery to complete/the consumer "
+                         "to finish, per format (default: 60).")
     p.add_argument("--connect-wait-secs", type=int, default=15,
                     help="Max seconds to wait for the --verify consumer to confirm it "
-                         "subscribed before publishing starts (default: 15).")
+                         "subscribed before publishing starts, per format (default: 15).")
     p.add_argument("--keep-dump", action="store_true",
-                    help="Don't delete the --verify consumer's dump file on exit; print its path.")
+                    help="Don't delete each --verify consumer's dump file on exit; print its path.")
+    p.add_argument("--metrics-json", default=None,
+                    help="Write the collected per-format metrics as JSON to this path.")
     return p.parse_args()
 
 
-def validate_format(raw):
-    fmt = raw.strip().lower()
-    if fmt not in FORMATS:
-        sys.exit(f"error: --format '{raw}' is not one of: {', '.join(FORMATS)}")
-    return fmt
+def parse_formats(raw):
+    tokens = [t.strip().lower() for t in raw.split(",") if t.strip()]
+    if not tokens:
+        sys.exit("error: --format must name at least one format")
+    if any(t == "all" for t in tokens):
+        return list(FORMATS)
+    seen = set()
+    formats = []
+    for t in tokens:
+        if t not in FORMATS:
+            sys.exit(f"error: --format '{t}' is not one of: {', '.join(FORMATS)} (or 'all')")
+        if t not in seen:
+            seen.add(t)
+            formats.append(t)
+    return formats
 
 
 def validate_sql(raw_sql):
@@ -210,13 +235,20 @@ def canonical(obj):
     return json.dumps(obj, sort_keys=True, ensure_ascii=False)
 
 
-def start_consumer(nats_tool, topic, fmt, max_msgs, dump_path, log_file):
+def start_consumer(nats_tool, topic, fmt, dump_path, log_file):
     cmd = [
         nats_tool, "grub",
         "--topic", topic,
         "--format", fmt,
         "--json",
-        "--max_msgs", str(max_msgs),
+        "--stats_interval", "1",
+        # grub mode never self-exits on message count anyway (only auto-
+        # unsubscribes - see the shutdown comment below), and an exact
+        # count isn't known ahead of time in this streaming design, so this
+        # is just a large placeholder - BUT it has to be present and > 0:
+        # mode_runners.hpp's on_connected only logs "subscribed to ..." at
+        # all (what wait_for_subscribed() polls for) when max_msgs > 0.
+        "--max_msgs", str(2**31 - 1),
         "--dump", dump_path,
     ]
     return subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
@@ -235,49 +267,101 @@ def wait_for_subscribed(log_path, timeout_secs):
     return False
 
 
+def wait_for_received_count(log_path, expected, timeout_secs):
+    """Polls the consumer's log for cumulative "Stats: N events/sec" lines
+    (summed across intervals - each line is a per-interval delta, not a
+    running total) until `expected` messages have been observed or
+    `timeout_secs` elapses. Returns (received_so_far, elapsed_secs).
+
+    This is what makes the --verify timing a real measurement instead of a
+    fixed sleep: without it, a small dataset would always report roughly
+    "N rows / whatever the fixed wait was", dominated by that wait rather
+    than actual delivery time.
+    """
+    start = time.monotonic()
+    deadline = start + timeout_secs
+    seen_lines = 0
+    total = 0
+    while total < expected and time.monotonic() < deadline:
+        try:
+            with open(log_path) as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            lines = []
+        for line in lines[seen_lines:]:
+            m = STATS_LINE_RE.search(line)
+            if m:
+                total += int(m.group(1))
+        seen_lines = len(lines)
+        if total >= expected:
+            break
+        time.sleep(0.15)
+    return total, time.monotonic() - start
+
+
 def build_publish_query(user_sql, limit, fmt, subject_expr, verify):
     # payload (row_to_<fmt>) is computed exactly once per row here and
-    # reused below for both the jsonb reference (--verify only) and the
-    # actual publish call, rather than invoking the encoder twice.
+    # reused below for the jsonb reference (--verify only), the payload
+    # size, and the actual publish call, rather than invoking the encoder
+    # more than once.
     limit_clause = sql.SQL(" LIMIT {}").format(sql.Literal(limit)) if limit else sql.SQL("")
     src = sql.SQL("SELECT *, {}(src) AS _e2e_payload FROM ({}) AS src{}").format(
         sql.Identifier(f"row_to_{fmt}"), sql.SQL(user_sql), limit_clause
     )
-    publish_col = sql.SQL("nats_publish_binary({}, t._e2e_payload)").format(subject_expr)
+    cols = []
     if verify:
-        select_list = sql.SQL("{}(t._e2e_payload), {}").format(
-            sql.Identifier(f"{fmt}_to_jsonb"), publish_col
-        )
-    else:
-        select_list = publish_col
+        cols.append(sql.SQL("{}(t._e2e_payload) AS _e2e_ref").format(sql.Identifier(f"{fmt}_to_jsonb")))
+    cols.append(sql.SQL("octet_length(t._e2e_payload) AS _e2e_bytes"))
+    cols.append(sql.SQL("nats_publish_binary({}, t._e2e_payload) AS _e2e_pub").format(subject_expr))
+    select_list = sql.SQL(", ").join(cols)
     return sql.SQL("SELECT {} FROM ({}) AS t").format(select_list, src)
 
 
 def build_count_query(publish_query):
     # No row data is needed back for the plain-publish (no --verify) path -
-    # just how many were published - so that path doesn't stream row-by-row
-    # at all: one statement, one round trip, Postgres does the counting.
-    return sql.SQL("SELECT count(*) FROM ({}) AS pub").format(publish_query)
+    # just how many were published and the payload-size distribution - so
+    # that path doesn't stream row-by-row at all: one statement, one round
+    # trip, Postgres does the counting and the aggregation.
+    return sql.SQL(
+        "SELECT count(*), sum(_e2e_bytes), avg(_e2e_bytes), min(_e2e_bytes), max(_e2e_bytes) "
+        "FROM ({}) AS pub"
+    ).format(publish_query)
 
 
-def main():
-    args = parse_args()
-    fmt = validate_format(args.format)
-    user_sql = validate_sql(args.sql)
-    subject_columns = parse_subject_columns(args.subject_columns)
+def fmt_secs(s):
+    return f"{s:.3f}s" if s is not None else "-"
 
-    if args.verify and not os.access(args.nats_tool, os.X_OK):
-        sys.exit(f"error: --verify given but nats_tool not found/executable at {args.nats_tool} "
-                 "(build ~/nats_asio first, or pass --nats-tool)")
 
+def fmt_rate(rows, secs):
+    if not secs or secs <= 0:
+        return "-"
+    return f"{rows / secs:,.0f}/s"
+
+
+def fmt_bytes(n):
+    if n is None:
+        return "-"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:,.0f}{unit}"
+        n /= 1024
+    return f"{n:,.0f}TB"
+
+
+def run_one_format(conn, args, fmt, subject_columns):
+    """Publishes --sql once, encoded as `fmt`, optionally verifying via
+    nats_tool. Never raises for an expected failure mode (bad SQL, bad
+    subject data, verify mismatch, etc) - returns a dict with an "error"
+    key set instead, so one format's failure doesn't stop a multi-format
+    --format run from reporting the others.
+    """
+    metrics = {"format": fmt, "error": None}
     subject_expr = build_subject_expr(
         subject_columns, args.subject_prefix, fmt, args.subject_format_suffix
     )
-    publish_query = build_publish_query(user_sql, args.limit, fmt, subject_expr, args.verify)
+    publish_query = build_publish_query(args.sql_stripped, args.limit, fmt, subject_expr, args.verify)
 
-    conn = psycopg.connect(args.dsn, autocommit=True)
-
-    dump_dir = tempfile.mkdtemp(prefix="nats_e2e_")
+    dump_dir = tempfile.mkdtemp(prefix=f"nats_e2e_{fmt}_")
     dump_path = os.path.join(dump_dir, f"{fmt}.jsonl")
     log_path = os.path.join(dump_dir, f"{fmt}.log")
     consumer = None
@@ -287,13 +371,9 @@ def main():
             topic = args.nats_topic or default_topic(
                 subject_columns, args.subject_prefix, fmt, args.subject_format_suffix
             )
-            print(f"== 1. Starting nats_tool consumer (topic={topic!r}) ==")
-            # Row count isn't known ahead of time in a streaming design, so
-            # the consumer can't be told an exact --max_msgs; give it an
-            # effectively-unbounded one and stop it explicitly once the
-            # publish side is done (see below).
+            print(f"== [{fmt}] 1. Starting nats_tool consumer (topic={topic!r}) ==")
             with open(log_path, "w") as log_file:
-                consumer = start_consumer(args.nats_tool, topic, fmt, 2**31 - 1, dump_path, log_file)
+                consumer = start_consumer(args.nats_tool, topic, fmt, dump_path, log_file)
             if not wait_for_subscribed(log_path, args.connect_wait_secs):
                 print(f"  WARNING: consumer did not confirm subscription within "
                       f"{args.connect_wait_secs}s -- proceeding anyway", file=sys.stderr)
@@ -302,53 +382,73 @@ def main():
 
         reference = None
         published = 0
+        total_bytes = min_bytes = max_bytes = None
+        t0 = time.perf_counter()
         if args.verify:
-            # Row data is needed back (for the jsonb reference), so this
-            # path streams row-by-row via cursor.stream() - also what gives
-            # --progress-every something to report incrementally on.
-            print(f"== 2. Streaming --sql and publishing as {fmt} ==")
+            print(f"== [{fmt}] 2. Streaming --sql and publishing ==")
             reference = []
+            total_bytes = 0
             try:
                 with conn.cursor() as cur:
-                    for row in cur.stream(publish_query):
-                        reference.append(canonical(row[0]))
+                    for ref, nbytes, _pub in cur.stream(publish_query):
+                        reference.append(canonical(ref))
+                        total_bytes += nbytes
+                        min_bytes = nbytes if min_bytes is None else min(min_bytes, nbytes)
+                        max_bytes = nbytes if max_bytes is None else max(max_bytes, nbytes)
                         published += 1
                         if args.progress_every and published % args.progress_every == 0:
                             print(f"  ...{published} published so far")
             except psycopg.Error as e:
-                sys.exit(f"error: publish failed after {published} row(s): {e}")
+                metrics["error"] = f"publish failed after {published} row(s): {e}"
+                return metrics
         else:
-            # No row data is needed back at all here - just a count - so
-            # this is one statement, one round trip, no row-by-row client
-            # iteration: Postgres does the counting, not this script.
-            print(f"== 1. Publishing as {fmt} ==")
+            print(f"== [{fmt}] 1. Publishing ==")
             try:
                 with conn.cursor() as cur:
                     cur.execute(build_count_query(publish_query))
-                    published = cur.fetchone()[0]
+                    published, total_bytes, _avg_bytes, min_bytes, max_bytes = cur.fetchone()
             except psycopg.Error as e:
-                sys.exit(f"error: publish failed: {e}")
-        print(f"  published {published} message(s)")
+                metrics["error"] = f"publish failed: {e}"
+                return metrics
+        publish_secs = time.perf_counter() - t0
+        print(f"  published {published} message(s) in {fmt_secs(publish_secs)} "
+              f"({fmt_rate(published, publish_secs)}, {fmt_bytes(total_bytes)} total)")
+
+        metrics.update(
+            rows=published, publish_secs=publish_secs,
+            total_bytes=total_bytes,
+            avg_bytes=(total_bytes / published) if published else None,
+            min_bytes=min_bytes, max_bytes=max_bytes,
+        )
 
         if published == 0:
-            sys.exit("error: --sql produced zero rows, nothing was published")
+            metrics["error"] = "--sql produced zero rows, nothing was published"
+            return metrics
 
         if not args.verify:
-            return
+            return metrics
+
+        print(f"== [{fmt}] 3. Waiting for delivery ==")
+        received_by_stats, receive_secs = wait_for_received_count(
+            log_path, published, args.timeout_secs
+        )
+        metrics["receive_secs"] = receive_secs
+        if received_by_stats < published:
+            print(f"  WARNING: only observed {received_by_stats}/{published} via consumer "
+                  f"stats within {args.timeout_secs}s -- proceeding to compare anyway",
+                  file=sys.stderr)
+        else:
+            print(f"  all {published} observed received in {fmt_secs(receive_secs)} "
+                  f"({fmt_rate(published, receive_secs)})")
 
         # grub mode has no self-exit: it only auto-unsubscribes after
-        # --max_msgs (nats_asio.hpp's increment_and_check()) and then keeps
-        # running - the only way to stop it is SIGINT/SIGTERM (see the
-        # comment at nats_tool.cpp's signal_set setup). That's also what
-        # triggers the dump file's flush-on-clean-exit (its ofstream is
-        # only auto-flushed every 100 messages otherwise - see
-        # message_output.hpp's dump_file_writer). So: give delivery a
-        # short settle window (local NATS delivery to an already-
-        # subscribed consumer is sub-second), then terminate() (SIGTERM,
-        # not kill()/SIGKILL) so that teardown - and the flush it does -
-        # actually runs, then wait for the now-clean exit.
-        print("== 3. Waiting for delivery, then stopping the consumer ==")
-        time.sleep(min(args.timeout_secs, 3))
+        # --max_msgs (not used here) and otherwise keeps running - the only
+        # way to stop it is SIGINT/SIGTERM (see the comment at
+        # nats_tool.cpp's signal_set setup). That's also what triggers the
+        # dump file's flush-on-clean-exit (its ofstream is only
+        # auto-flushed every 100 messages otherwise - see
+        # message_output.hpp's dump_file_writer), so terminate() (SIGTERM,
+        # not kill()/SIGKILL) rather than just killing it once satisfied.
         consumer.terminate()
         try:
             consumer.wait(timeout=args.timeout_secs)
@@ -366,7 +466,7 @@ def main():
                     if line:
                         received.append(canonical(json.loads(line)))
 
-        print("== 4. Comparing ==")
+        print(f"== [{fmt}] 4. Comparing ==")
         print(f"  reference: {len(reference)}, received: {len(received)}")
 
         exp_sorted = sorted(reference)
@@ -374,9 +474,9 @@ def main():
         if exp_sorted == act_sorted:
             print(f"  PASS: all {len(reference)} rows received and decoded correctly "
                   "(unordered content match)")
-            sys.exit(0)
+            metrics["verify_result"] = "PASS"
+            return metrics
 
-        # Multiset diff for a useful report even when counts match but content differs.
         exp_counts = Counter(reference)
         act_counts = Counter(received)
         missing = exp_counts - act_counts
@@ -387,14 +487,91 @@ def main():
             print(f"    missing[{i}]: {s[:300]}")
         for i, s in enumerate(list(extra.elements())[:3]):
             print(f"    extra[{i}]:   {s[:300]}")
-        sys.exit(1)
+        metrics["verify_result"] = "FAIL"
+        metrics["error"] = f"{sum(missing.values())} missing, {sum(extra.values())} unexpected"
+        return metrics
     finally:
         if consumer and consumer.poll() is None:
             consumer.kill()
         if args.keep_dump:
-            print(f"(dump kept at {dump_dir})")
+            print(f"  (dump kept at {dump_dir})")
         else:
             shutil.rmtree(dump_dir, ignore_errors=True)
+
+
+def print_comparison(results, verify):
+    print("\n== Format comparison ==")
+    headers = ["format", "rows", "avg bytes", "publish", "publish rate"]
+    if verify:
+        headers += ["receive", "receive rate", "verify"]
+    rows = []
+    for r in results:
+        if r.get("error") and r.get("rows") is None:
+            rows.append([r["format"], "ERROR: " + r["error"]])
+            continue
+        row = [
+            r["format"],
+            str(r["rows"]),
+            fmt_bytes(r["avg_bytes"]),
+            fmt_secs(r["publish_secs"]),
+            fmt_rate(r["rows"], r["publish_secs"]),
+        ]
+        if verify:
+            row += [
+                fmt_secs(r.get("receive_secs")),
+                fmt_rate(r["rows"], r.get("receive_secs")),
+                r.get("verify_result") or ("ERROR" if r.get("error") else "-"),
+            ]
+        rows.append(row)
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            if i < len(widths):
+                widths[i] = max(widths[i], len(cell))
+    def fmt_row(cells):
+        return "  ".join(c.ljust(widths[i]) if i < len(widths) else c for i, c in enumerate(cells))
+    print(fmt_row(headers))
+    print(fmt_row(["-" * w for w in widths]))
+    for row in rows:
+        print(fmt_row(row))
+
+
+def main():
+    args = parse_args()
+    formats = parse_formats(args.format)
+    args.sql_stripped = validate_sql(args.sql)
+    subject_columns = parse_subject_columns(args.subject_columns)
+
+    if args.verify and not os.access(args.nats_tool, os.X_OK):
+        sys.exit(f"error: --verify given but nats_tool not found/executable at {args.nats_tool} "
+                 "(build ~/nats_asio first, or pass --nats-tool)")
+    if args.nats_topic and len(formats) > 1:
+        sys.exit("error: --nats-topic can't be used with more than one --format "
+                 "(each format needs its own topic to avoid collisions)")
+
+    conn = psycopg.connect(args.dsn, autocommit=True)
+
+    results = []
+    any_error = False
+    for i, fmt in enumerate(formats):
+        if len(formats) > 1:
+            print(f"\n### format {i + 1}/{len(formats)}: {fmt} ###")
+        r = run_one_format(conn, args, fmt, subject_columns)
+        results.append(r)
+        if r.get("error"):
+            any_error = True
+            print(f"  ERROR: {r['error']}", file=sys.stderr)
+
+    if len(formats) > 1:
+        print_comparison(results, args.verify)
+
+    if args.metrics_json:
+        with open(args.metrics_json, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"\nMetrics written to {args.metrics_json}")
+
+    sys.exit(1 if any_error else 0)
 
 
 if __name__ == "__main__":

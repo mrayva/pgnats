@@ -160,6 +160,39 @@ unique per row, so content -- not subject -- is what's compared). Run with
 `--help` for the full option list (`--subject-prefix`, `--nats-topic`,
 `--dsn`, timeouts, etc).
 
+**Comparing formats**: pass `--format all` (or a comma-separated subset,
+e.g. `--format msgpack,cbor,bson`) to run the same `--sql` through each
+format in turn and print a comparison table -- rows published, average
+payload size, publish throughput, and (with `--verify`) delivery time and
+per-format PASS/FAIL:
+
+```
+format       rows  avg bytes  publish  publish rate  receive  receive rate  verify
+-----------  ----  ---------  -------  ------------  -------  ------------  ------
+msgpack      3005  66B        0.023s   132,014/s     0.901s   3,334/s       PASS
+cbor         3005  66B        0.015s   195,038/s     0.901s   3,334/s       PASS
+zera         3005  176B       0.017s   177,810/s     0.901s   3,334/s       PASS
+...
+```
+
+One format failing (a bad subject value, a decode mismatch) doesn't stop
+the run -- it's reported in that format's row and the process exits
+non-zero, but every other format still runs and reports its own results.
+`--metrics-json PATH` writes the same per-format numbers out as JSON.
+
+Two things worth knowing about what these numbers mean: "publish rate" is
+a pure database-side measurement (encode + `nats_publish_binary()`, timed
+around a single statement) with no network/consumer overhead in it.
+"receive rate" (`--verify` only) is end-to-end delivery time, measured by
+polling `nats_tool`'s own periodic stats log rather than a fixed wait --
+but that log only updates once per second (`--stats_interval` is
+whole seconds, no finer setting exists), so for a dataset that delivers
+in under a second (typical for anything up to a few thousand rows over
+loopback), "receive rate" reads as a floor around 1 second regardless of
+how fast delivery actually was. It's a real, non-fabricated measurement,
+just one with a coarse floor -- it becomes meaningful once actual
+delivery time exceeds that ~1s granularity.
+
 `--sql` is never materialized into a table: it's wrapped in a single query
 that computes each row's payload once (`row_to_<fmt>`) and both publishes
 it and (with `--verify`) projects its jsonb reference from that same
