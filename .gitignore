@@ -2,3 +2,5 @@
 
 /target
 /tests/certs
+
+/scripts/out/
