@@ -1,0 +1,177 @@
+name: Zerialize E2E
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  zerialize-e2e:
+    name: Postgres -> pg_zerialize -> pgnats -> NATS -> nats_tool
+    runs-on: ubuntu-24.04
+    env:
+      PG_MAJOR: 18
+      PG_CONFIG: /usr/lib/postgresql/18/bin/pg_config
+      PGPORT: 5418
+      PGDATABASE: postgres
+      NATS_SERVER_VERSION: v2.14.4
+      CARGO_PGRX_VERSION: 0.19.1
+
+    steps:
+      - name: Checkout pgnats
+        uses: actions/checkout@v5
+        with:
+          path: pgnats
+
+      - name: Checkout pg_zerialize
+        uses: actions/checkout@v5
+        with:
+          repository: mrayva/pg_zerialize
+          path: pg_zerialize
+
+      - name: Checkout nats_asio
+        uses: actions/checkout@v5
+        with:
+          repository: mrayva/nats_asio
+          path: nats_asio
+
+      # Same PGDG apt setup pg_zerialize's own CI uses.
+      - name: Configure PostgreSQL Apt repository
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl --fail --silent --show-error \
+            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          printf '%s\n' \
+            'Types: deb' \
+            'URIs: https://apt.postgresql.org/pub/repos/apt' \
+            "Suites: ${VERSION_CODENAME}-pgdg" \
+            'Components: main' \
+            'Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc' \
+            | sudo tee /etc/apt/sources.list.d/pgdg.sources
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            libclang-dev \
+            pkg-config \
+            bison \
+            flex \
+            libreadline-dev \
+            zlib1g-dev \
+            libssl-dev \
+            libflatbuffers-dev \
+            libfast-float-dev \
+            libmsgpack-dev \
+            ninja-build \
+            "postgresql-${PG_MAJOR}" \
+            "postgresql-server-dev-${PG_MAJOR}"
+          echo "/usr/lib/postgresql/${PG_MAJOR}/bin" >> "$GITHUB_PATH"
+
+      - name: Install NATS server
+        run: |
+          mkdir -p "${{ github.workspace }}/nats-server-bin"
+          curl -sL "https://github.com/nats-io/nats-server/releases/download/${NATS_SERVER_VERSION}/nats-server-${NATS_SERVER_VERSION}-linux-amd64.tar.gz" \
+            | tar xz --strip-components=1 -C "${{ github.workspace }}/nats-server-bin" --wildcards '*/nats-server'
+          echo "${{ github.workspace }}/nats-server-bin" >> "$GITHUB_PATH"
+          "${{ github.workspace }}/nats-server-bin/nats-server" --version
+
+      # Build+install pg_zerialize and pgnats *before* starting any Postgres
+      # cluster: pgnats needs shared_preload_libraries='pgnats' set at
+      # startup (see pgnats's own README), which means its .so has to exist
+      # in $libdir before the cluster we point that setting at ever starts.
+      - name: Build and install pg_zerialize
+        working-directory: pg_zerialize
+        run: |
+          make -j"$(nproc)"
+          sudo make PG_CONFIG="$PG_CONFIG" install
+
+      - name: Install cargo-pgrx
+        run: |
+          cargo install cargo-pgrx --version "${CARGO_PGRX_VERSION}" --locked
+          cargo pgrx init "--pg${PG_MAJOR}" "$PG_CONFIG" --skip-version-check
+
+      - name: Build and install pgnats
+        working-directory: pgnats
+        run: |
+          sudo chown -R "$USER:$USER" "/usr/share/postgresql/${PG_MAJOR}/extension/" "/usr/lib/postgresql/${PG_MAJOR}/lib/"
+          CFLAGS="-std=gnu11" cargo pgrx install --release --pg-config "$PG_CONFIG"
+          sudo chown -R root:root "/usr/share/postgresql/${PG_MAJOR}/extension/" "/usr/lib/postgresql/${PG_MAJOR}/lib/"
+
+      # shared_preload_libraries has to be set before first start, unlike
+      # pg_zerialize/other extensions which only need CREATE EXTENSION.
+      - name: Start PostgreSQL
+        run: |
+          sudo pg_ctlcluster "$PG_MAJOR" main stop || true
+          if ! pg_lsclusters | awk '{print $1, $2}' | grep -qx "$PG_MAJOR main"; then
+            sudo pg_createcluster "$PG_MAJOR" main
+          fi
+          sudo pg_conftool "$PG_MAJOR" main set port "$PGPORT"
+          sudo pg_conftool "$PG_MAJOR" main set shared_preload_libraries "pgnats"
+          sudo pg_ctlcluster "$PG_MAJOR" main start
+          sudo -u postgres createuser -p "$PGPORT" -s "$USER" || true
+
+      - name: Configure extensions and NATS foreign server
+        run: |
+          psql -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_zerialize;"
+          psql -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pgnats;"
+          psql -v ON_ERROR_STOP=1 -c "
+            CREATE SERVER nats_fdw_server FOREIGN DATA WRAPPER pgnats_fdw OPTIONS (
+              host 'localhost',
+              port '4222',
+              capacity '128'
+            );
+          "
+
+      - name: Start NATS server
+        run: |
+          nats-server -js > /tmp/nats-server.log 2>&1 &
+          for _ in $(seq 1 20); do
+            if (exec 3<>/dev/tcp/localhost/4222) 2>/dev/null; then
+              exec 3<&- 3>&-
+              echo "NATS server is up"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "NATS server did not come up in time" >&2
+          cat /tmp/nats-server.log
+          exit 1
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11.6
+        with:
+          vcpkgGitCommitId: f87344cac03158cbf1467264565f1fd36b382a24
+
+      - name: Build nats_tool
+        working-directory: nats_asio
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake
+          -DVCPKG_OVERLAY_TRIPLETS=${{ github.workspace }}/nats_asio/triplets
+          -DNATS_ASIO_BUILD_SAMPLES=ON
+          -DNATS_ASIO_BUILD_TESTS=OFF
+          && cmake --build build --parallel "$(nproc)"
+
+      - name: Run the end-to-end test
+        working-directory: pgnats
+        env:
+          NATS_TOOL: ${{ github.workspace }}/nats_asio/build/bin/nats_tool
+        run: ./scripts/zerialize_e2e_test.sh
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "=== NATS server log ==="
+          cat /tmp/nats-server.log || true
+          echo "=== nats_tool consumer logs ==="
+          for f in pgnats/scripts/out/*.log; do
+            echo "--- $f ---"
+            cat "$f" || true
+          done
