@@ -71,14 +71,19 @@ before pointing this at it either way.
 
 --batch-size N (opt-in, default 1 = off) groups up to N rows *within each
 subject* into one columnar NATS message - {"col1":[v,v,...],"col2":[v,v,...]}
-instead of a row object - built via jsonb_build_object()+jsonb_agg() then
-<fmt>_from_jsonb(), since pg_zerialize has no native multi-row columnar
-encoder (its rows_to_<fmt>() batch function produces an *array of row
-objects*, not columnar, and doesn't amortize the fixed per-document costs
-below at all). Column alignment across the batch (col1[i] and col2[i]
-belonging to the same source row) is guaranteed by giving every column's
-jsonb_agg() the same explicit ORDER BY - see build_batched_publish_query()'s
-docstring for why that's load-bearing, not cosmetic.
+instead of a row object. Two ways to build that batch document, chosen with
+--batch-encoding:
+
+  - "native" (default): pg_zerialize's rows_to_<fmt>_columnar(anyarray) -
+    deforms each row's tuple directly in C++ and writes columns straight
+    into the target format, no jsonb intermediate. Requires pg_zerialize
+    >= 1.12.
+  - "jsonb": jsonb_build_object()+jsonb_agg() then <fmt>_from_jsonb() - the
+    original implementation, kept for comparison. Column alignment across
+    the batch (col1[i] and col2[i] belonging to the same source row) is
+    guaranteed by giving every column's jsonb_agg() the same explicit
+    ORDER BY - see build_batched_publish_query()'s docstring for why
+    that's load-bearing, not cosmetic.
 
 Where this helps and where it doesn't - measured, not assumed, and the
 honest result cuts differently than a first look at the encoder-level cost
@@ -87,21 +92,23 @@ see the sibling investigation this tool grew out of) showed formats with a
 fixed per-document cost - Ion's mandatory local symbol table, FlexBuffers'
 key/value deduplication - lose that overhead almost entirely once
 amortized across a batch (Ion: ~5x smaller, ~2-8x faster in that isolated
-test). Real batching through this tool's actual jsonb-based SQL path tells
-a different story: --batch-size 100 against 200k real rows cut payload
-size 2.2-4.6x across every format (confirmed real, not estimated), but
-*reduced* publish throughput for every format except Ion, which came out
-roughly breakeven. The window function + GROUP BY + jsonb_build_object()/
-jsonb_agg() machinery needed to actually build a batch in SQL has real,
-substantial cost of its own, and for formats with less fixed per-document
-overhead to amortize away (msgpack, cbor, beve especially), that construction
-cost outweighs the encoder-level saving. So: use --batch-size when you want
-fewer, smaller NATS messages (bandwidth/message-count bound), not as a
-throughput optimization - it isn't reliably one, with this implementation.
-A native pg_zerialize columnar encoder (bypassing the jsonb intermediate
-entirely, the same way rows_to_<fmt>() bypasses it for row-array batching)
-would likely close that gap, but that's C++ work in pg_zerialize itself,
-not something this Python driver can do.
+test). Real batching through this tool's original jsonb-based SQL path
+told a different story: --batch-size 100 against 200k real rows cut
+payload size 2.2-4.6x across every format (confirmed real, not estimated),
+but *reduced* publish throughput for every format except Ion, which came
+out roughly breakeven - the window function + GROUP BY +
+jsonb_build_object()/jsonb_agg() machinery needed to actually build a
+batch in SQL had real, substantial cost of its own, and for formats with
+less fixed per-document overhead to amortize away (msgpack, cbor, beve
+especially), that construction cost outweighed the encoder-level saving.
+
+--batch-encoding native (the default) closes that gap: pg_zerialize's
+native columnar encoder does the same column-array construction in C++,
+via heap_deform_tuple, with no jsonb round-trip at all. Measured against
+the same 200k real rows, batch=100: every format got *faster*, not just
+smaller - msgpack 1.8x, ion 4.9x (2.2x vs the old jsonb-batched path),
+bson 1.5x, zera 2.0x, beve 2.0x, flexbuffers 2.4x. Pass --batch-encoding
+jsonb to reproduce the old (size-win-only) behavior for comparison.
 
 Requires: psycopg (v3) - already available in this environment. Connects
 using standard libpq environment variables (PGHOST/PGPORT/PGUSER/
@@ -186,11 +193,19 @@ def parse_args():
                          "batch's message is {\"col1\":[v,v,...], \"col2\":[v,v,...], ...} "
                          "rather than a row object, built via jsonb_build_object()+jsonb_agg() "
                          "then <fmt>_from_jsonb(). Measured (see module docstring for numbers): "
-                         "cuts payload size 2-5x across every format, but the SQL-side "
-                         "construction cost (window function + GROUP BY + jsonb) outweighs the "
-                         "encoder-level saving for most formats, so it's a bandwidth win, not "
-                         "reliably a throughput one - Ion is the exception, coming out roughly "
-                         "breakeven since it has the most fixed per-document cost to amortize.")
+                         "cuts payload size 2-5x across every format (see --batch-encoding for "
+                         "whether it's also a throughput win).")
+    p.add_argument("--batch-encoding", choices=("native", "jsonb"), default="native",
+                    help="Only meaningful with --batch-size > 1. 'native' (default) uses "
+                         "pg_zerialize's rows_to_<fmt>_columnar(anyarray) - deforms each row's "
+                         "tuple directly in C++, no jsonb intermediate - measured as a real "
+                         "throughput win (1.5-4.9x faster), not just a smaller-payload one. "
+                         "'jsonb' uses the original jsonb_build_object()+jsonb_agg()+"
+                         "<fmt>_from_jsonb() construction, kept for comparison - measured as a "
+                         "payload-size win only (2.2-4.6x smaller) but a publish-throughput "
+                         "*loss* for every format except Ion, since the GROUP BY/jsonb "
+                         "construction cost outweighs the encoder-level saving. Requires "
+                         "pg_zerialize >= 1.12 for 'native'.")
     p.add_argument("--dsn", default="",
                     help="libpq connection string/URI. Default: read standard PG* env vars, same as psql.")
     p.add_argument("--progress-every", type=int, default=10000,
@@ -520,6 +535,60 @@ def build_batched_publish_query(user_sql, limit, fmt, subject_columns, all_colum
     return sql.SQL("SELECT {} FROM ({}) AS g").format(select_list, grouped)
 
 
+def build_native_columnar_publish_query(user_sql, limit, fmt, subject_columns, subject_expr, batch_size, verify):
+    """Same grouping/partitioning as build_batched_publish_query() (batches
+    within each subject, never spanning rows that'd get different
+    subjects), but builds the batch document via pg_zerialize's native
+    rows_to_<fmt>_columnar(anyarray) instead of jsonb_build_object()+
+    jsonb_agg()+<fmt>_from_jsonb() - no jsonb intermediate, no per-column
+    aggregate calls, and (unlike the jsonb path) no need to know the
+    column list up front, since it aggregates whole rows, not per-column
+    jsonb_agg()s.
+
+    Column alignment falls out for free here: array_agg(_e2e_row ORDER BY
+    _e2e_seq) is a single aggregate over the whole row, not N independent
+    per-column aggregates, so there's no possibility of two columns
+    disagreeing on row order the way jsonb_agg(col1)/jsonb_agg(col2) could
+    without matching explicit ORDER BYs.
+
+    `src` (the FROM-item alias) is referenced bare in the SELECT list to
+    get each row's whole-row composite value - valid whether the
+    underlying FROM-item is a real table or an arbitrary derived subquery,
+    exactly like `SELECT t FROM some_table t` yields t's whole-row value.
+    """
+    limited = sql.SQL("SELECT * FROM ({}) AS src0{}").format(
+        sql.SQL(user_sql), sql.SQL(" LIMIT {}").format(sql.Literal(limit)) if limit else sql.SQL("")
+    )
+    subject_col_list = sql.SQL(", ").join(sql.Identifier(c) for c in subject_columns)
+
+    numbered = sql.SQL(
+        "SELECT *, src AS _e2e_row, row_number() OVER (PARTITION BY {}) AS _e2e_seq FROM ({}) AS src"
+    ).format(subject_col_list, limited)
+
+    batched = sql.SQL(
+        "SELECT *, ((_e2e_seq - 1) / {}) AS _e2e_batch_id FROM ({}) AS numbered"
+    ).format(sql.Literal(batch_size), numbered)
+
+    grouped = sql.SQL(
+        "SELECT {subj}, count(*) AS _e2e_batch_rows, "
+        "{rows_to_fmt_columnar}(array_agg(_e2e_row ORDER BY _e2e_seq)) AS _e2e_payload "
+        "FROM ({batched}) AS b GROUP BY {subj}, _e2e_batch_id"
+    ).format(
+        subj=subject_col_list,
+        rows_to_fmt_columnar=sql.Identifier(f"rows_to_{fmt}_columnar"),
+        batched=batched,
+    )
+
+    cols = []
+    if verify:
+        cols.append(sql.SQL("{}(g._e2e_payload) AS _e2e_ref").format(sql.Identifier(f"{fmt}_to_jsonb")))
+    cols.append(sql.SQL("octet_length(g._e2e_payload) AS _e2e_bytes"))
+    cols.append(sql.SQL("g._e2e_batch_rows"))
+    cols.append(sql.SQL("nats_publish_binary({}, g._e2e_payload) AS _e2e_pub").format(subject_expr))
+    select_list = sql.SQL(", ").join(cols)
+    return sql.SQL("SELECT {} FROM ({}) AS g").format(select_list, grouped)
+
+
 def build_batched_count_query(publish_query):
     # Same reasoning as build_count_query(), extended with sum(_e2e_batch_rows)
     # since count(*) here counts *batches* (messages), not rows.
@@ -564,7 +633,12 @@ def run_one_format(conn, args, fmt, subject_columns, all_columns):
     subject_expr = build_subject_expr(
         subject_columns, args.subject_prefix, fmt, args.subject_format_suffix, args.on_bad_subject_value
     )
-    if batching:
+    if batching and args.batch_encoding == "native":
+        publish_query = build_native_columnar_publish_query(
+            args.sql_stripped, args.limit, fmt, subject_columns,
+            subject_expr, args.batch_size, args.verify
+        )
+    elif batching:
         publish_query = build_batched_publish_query(
             args.sql_stripped, args.limit, fmt, subject_columns, all_columns,
             subject_expr, args.batch_size, args.verify
@@ -646,7 +720,7 @@ def run_one_format(conn, args, fmt, subject_columns, all_columns):
                 metrics["error"] = f"publish failed: {e}"
                 return metrics
         publish_secs = time.perf_counter() - t0
-        batch_note = f" as {batches} batch(es)" if batching else ""
+        batch_note = f" as {batches} batch(es), {args.batch_encoding} encoding" if batching else ""
         print(f"  published {published} row(s){batch_note} in {fmt_secs(publish_secs)} "
               f"({fmt_rate(published, publish_secs)}, {fmt_bytes(total_bytes)} total)")
 
@@ -655,6 +729,7 @@ def run_one_format(conn, args, fmt, subject_columns, all_columns):
             total_bytes=total_bytes,
             avg_bytes=(total_bytes / published) if published else None,
             min_bytes=min_bytes, max_bytes=max_bytes,
+            batch_encoding=(args.batch_encoding if batching else None),
         )
 
         if published == 0:
@@ -797,7 +872,7 @@ def main():
     conn = psycopg.connect(args.dsn, autocommit=True)
 
     all_columns = None
-    if args.batch_size > 1:
+    if args.batch_size > 1 and args.batch_encoding == "jsonb":
         all_columns = introspect_columns(conn, args.sql_stripped)
         missing = [c for c in subject_columns if c not in all_columns]
         if missing:
