@@ -55,13 +55,19 @@ row data back in Python:
     --progress-every reports against, and where payload-size stats are
     accumulated in Python instead of via a separate query.
 
-The tradeoff either way: a bad subject-column value is only caught at the
-row it occurs on (see "safety" in build_subject_expr()'s docstring below)
-- rows the server already evaluated by then have already been published,
-since NATS publish side effects aren't transactional/rollback-able. If
-you need a hard guarantee that nothing gets published unless the whole
-result set is clean, filter/validate the source data before pointing
-this at it.
+A subject-column value containing whitespace, '.', or a NATS wildcard
+character ('*'/'>') would otherwise corrupt the subject's token structure
+(see build_subject_expr()'s docstring). By default (--on-bad-subject-value
+normalize) those characters are collapsed to '_' and every row publishes -
+real-world data commonly has this (NYSE symbols like "AAM WS", tickers
+like "BRK.A"), and only the subject is affected, never the payload. Pass
+--on-bad-subject-value reject for the opposite: abort the whole run at the
+first bad value instead - but note that's only caught at the row it occurs
+on, so rows the server already evaluated by then have already been
+published, since NATS publish side effects aren't transactional/
+rollback-able. If you need a hard guarantee that nothing gets published
+unless the whole result set is clean, filter/validate the source data
+before pointing this at it either way.
 
 Requires: psycopg (v3) - already available in this environment. Connects
 using standard libpq environment variables (PGHOST/PGPORT/PGUSER/
@@ -84,14 +90,19 @@ from psycopg import sql
 
 FORMATS = ("msgpack", "cbor", "zera", "flexbuffers", "ion", "bson", "beve")
 
-# NATS subject tokens can't contain whitespace or the wildcard characters
-# '*'/'>' - a column value containing one of those would silently corrupt
-# the subject's token structure downstream (e.g. turn a value into an
-# unintended wildcard subscription match). Postgres's ~ operator
-# understands \s in ARE (advanced regex) mode, its default, so this same
-# pattern is pushed server-side as part of the per-row subject expression
-# itself (see build_subject_expr()) rather than checked in Python.
-BAD_SUBJECT_TOKEN_PATTERN = r"[\s*>]"
+# A NATS subject token can't contain whitespace or the wildcard characters
+# '*'/'>' (they'd change what the token means to a subscriber), and '.'
+# specifically can't appear in a *column value* used to build a subject
+# because '.' is this tool's own token separator - a value containing one
+# silently splits into an extra token, corrupting the subject's structure
+# with no error at all. Real-world data hits both: NYSE trade data has
+# symbols with embedded spaces (warrant/rights tickers like "AAM WS") and,
+# separately, class-of-share tickers with embedded dots (e.g. "BRK.A") are
+# common enough elsewhere to matter. Postgres's ~ operator understands \s
+# in ARE (advanced regex) mode, its default, so this same pattern is
+# pushed server-side as part of the per-row subject expression itself (see
+# build_subject_expr()) rather than checked in Python.
+BAD_SUBJECT_TOKEN_PATTERN = r"[\s.*>]"
 
 STATS_LINE_RE = re.compile(r"Stats: (\d+) events/sec")
 
@@ -121,6 +132,15 @@ def parse_args():
                          "'N.AAPL.msgpack' (default: on). Lets consumers subscribe by format "
                          "(e.g. '*.*.msgpack'), and is what keeps multiple formats run via "
                          "--format from colliding on the same subjects.")
+    p.add_argument("--on-bad-subject-value", choices=("normalize", "reject"), default="normalize",
+                    help="How to handle a subject-column value containing whitespace, '.', or a "
+                         "NATS wildcard character ('*'/'>'). 'normalize' (default) collapses runs "
+                         "of them to a single '_' and publishes every row - real-world data "
+                         "commonly has this (e.g. NYSE symbols like 'AAM WS', or class-of-share "
+                         "tickers like 'BRK.A'); the payload is never affected, only the subject. "
+                         "'reject' aborts the whole run at the first bad value instead (see the "
+                         "module docstring for what that means for rows already published by "
+                         "then).")
     p.add_argument("--limit", type=int, default=None,
                     help="Cap the number of rows published (applied to --sql's result). "
                          "Strongly recommended for large tables.")
@@ -189,32 +209,52 @@ def parse_subject_columns(raw):
     return cols
 
 
-def build_subject_expr(subject_columns, prefix, fmt, format_suffix):
+def build_subject_expr(subject_columns, prefix, fmt, format_suffix, on_bad_value):
     """Builds the per-row subject expression.
 
-    Safety: each column's value is checked in-line against
-    BAD_SUBJECT_TOKEN_PATTERN and, on a match, deliberately casts an
-    error-describing string to integer - not a real conversion, just the
-    simplest way to make Postgres raise a real, readable ERROR (aborting
-    the query at that row) without a helper function or a separate
-    validation pass. See the module docstring for what that means for
-    rows the server already streamed past by the time it hits a bad one.
+    Safety, one of two modes (--on-bad-subject-value):
+
+    - "normalize" (default): runs of whitespace/'.'/wildcard characters in
+      a column value are collapsed to a single '_' (regexp_replace with
+      the 'g' flag) before being used as a subject token. Lossy for the
+      subject only - the published payload is always the row's real,
+      untouched data - but means real-world data (e.g. NYSE symbols like
+      "AAM WS" with an embedded space, or class-of-share tickers like
+      "BRK.A") doesn't abort the whole run. Rare, accepted tradeoff: two
+      distinct values that normalize to the same token (e.g. "AAM WS" and
+      "AAM_WS", if both existed) become indistinguishable *by subject* -
+      their payloads on NATS remain correct and distinct either way.
+    - "reject": each value is checked in-line against
+      BAD_SUBJECT_TOKEN_PATTERN and, on a match, deliberately casts an
+      error-describing string to integer - not a real conversion, just the
+      simplest way to make Postgres raise a real, readable ERROR (aborting
+      the query at that row) without a helper function or a separate
+      validation pass. See the module docstring for what that means for
+      rows the server already streamed past by the time it hits a bad one.
     """
     parts = []
     for col in subject_columns:
         ident = sql.Identifier(col)
-        parts.append(
-            sql.SQL(
-                "CASE WHEN {ident} IS NULL THEN '_NULL_' "
-                "WHEN {ident}::text ~ {pattern} "
-                "THEN ((('bad subject value for column ' || {name} || ': ' || {ident}::text))::integer)::text "
-                "ELSE {ident}::text END"
-            ).format(
-                ident=ident,
-                pattern=sql.Literal(BAD_SUBJECT_TOKEN_PATTERN),
-                name=sql.Literal(col),
+        if on_bad_value == "normalize":
+            parts.append(
+                sql.SQL(
+                    "CASE WHEN {ident} IS NULL THEN '_NULL_' "
+                    "ELSE regexp_replace({ident}::text, {pattern}, '_', 'g') END"
+                ).format(ident=ident, pattern=sql.Literal(BAD_SUBJECT_TOKEN_PATTERN + "+"))
             )
-        )
+        else:
+            parts.append(
+                sql.SQL(
+                    "CASE WHEN {ident} IS NULL THEN '_NULL_' "
+                    "WHEN {ident}::text ~ {pattern} "
+                    "THEN ((('bad subject value for column ' || {name} || ': ' || {ident}::text))::integer)::text "
+                    "ELSE {ident}::text END"
+                ).format(
+                    ident=ident,
+                    pattern=sql.Literal(BAD_SUBJECT_TOKEN_PATTERN),
+                    name=sql.Literal(col),
+                )
+            )
     if format_suffix:
         parts.append(sql.Literal(fmt))
     expr = sql.SQL(" || '.' || ").join(parts)
@@ -382,7 +422,7 @@ def run_one_format(conn, args, fmt, subject_columns):
     """
     metrics = {"format": fmt, "error": None}
     subject_expr = build_subject_expr(
-        subject_columns, args.subject_prefix, fmt, args.subject_format_suffix
+        subject_columns, args.subject_prefix, fmt, args.subject_format_suffix, args.on_bad_subject_value
     )
     publish_query = build_publish_query(args.sql_stripped, args.limit, fmt, subject_expr, args.verify)
 

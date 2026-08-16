@@ -203,15 +203,24 @@ Python, Postgres does the counting. With `--verify`, the reference values
 have to end up in Python for the comparison anyway, so that path fetches
 row-by-row via psycopg's `cursor.stream()` (libpq single-row mode, not a
 real server-side cursor) instead - which is also what `--progress-every`
-reports against. The tradeoff either way: a subject-column value
-containing whitespace or a NATS wildcard character (`*`/`>`) is only
-caught at the row it occurs on -- rows the server already evaluated by
-then have already been published, since NATS publish isn't transactional
-(without `--verify`, a failure like this can't even report how many rows
-got that far, since nothing is counted client-side until the whole
-statement finishes or errors). Filter/validate the source data first if
-you need a guarantee that nothing gets published unless the whole result
-set is clean.
+reports against.
+
+A subject-column value containing whitespace, `.`, or a NATS wildcard
+character (`*`/`>`) would otherwise corrupt the subject's token structure.
+By default (`--on-bad-subject-value normalize`) those characters are
+collapsed to `_` and every row still publishes -- real-world data commonly
+has this (confirmed against a real NYSE trade table: symbols like `AAM WS`
+and class-of-share tickers like `BRK.A`), and only the *subject* is
+affected, the published payload is always the row's real, untouched data.
+Pass `--on-bad-subject-value reject` for the opposite: abort the whole run
+at the first bad value -- but that's only caught at the row it occurs on,
+so rows the server already evaluated by then have already been published,
+since NATS publish isn't transactional (without `--verify`, a failure like
+this can't even report how many rows got that far, since nothing is
+counted client-side until the whole statement finishes or errors). Filter/
+validate the source data first if you need a guarantee that nothing gets
+published unless the whole result set is clean, regardless of which mode
+you use.
 
 ## 🦀 Minimum supported Rust version
 
