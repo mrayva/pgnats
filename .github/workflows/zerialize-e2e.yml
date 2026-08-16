@@ -94,13 +94,13 @@ jobs:
       - name: Install cargo-pgrx
         run: |
           cargo install cargo-pgrx --version "${CARGO_PGRX_VERSION}" --locked
-          cargo pgrx init "--pg${PG_MAJOR}" "$PG_CONFIG" --skip-version-check
+          "$HOME/.cargo/bin/cargo-pgrx" init "--pg${PG_MAJOR}" "$PG_CONFIG" --skip-version-check
 
       - name: Build and install pgnats
         working-directory: pgnats
         run: |
           sudo chown -R "$USER:$USER" "/usr/share/postgresql/${PG_MAJOR}/extension/" "/usr/lib/postgresql/${PG_MAJOR}/lib/"
-          CFLAGS="-std=gnu11" cargo pgrx install --release --pg-config "$PG_CONFIG"
+          CFLAGS="-std=gnu11" "$HOME/.cargo/bin/cargo-pgrx" install --release --pg-config "$PG_CONFIG"
           sudo chown -R root:root "/usr/share/postgresql/${PG_MAJOR}/extension/" "/usr/lib/postgresql/${PG_MAJOR}/lib/"
 
       # shared_preload_libraries has to be set before first start, unlike
