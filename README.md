@@ -222,6 +222,34 @@ validate the source data first if you need a guarantee that nothing gets
 published unless the whole result set is clean, regardless of which mode
 you use.
 
+**Batching rows into columnar messages**: `--batch-size N` (opt-in, default
+1/off) groups up to N rows *within each subject* into one message shaped
+`{"col1":[v,v,...], "col2":[v,v,...], ...}` instead of one row-object
+message per row, via `jsonb_build_object()`+`jsonb_agg()` then
+`<fmt>_from_jsonb()` (pg_zerialize has no native multi-row *columnar*
+encoder -- its `rows_to_<fmt>()` batch function produces an array of row
+objects, which doesn't amortize the costs below at all). Measured against
+200k real rows, `--batch-size 100`:
+
+- Cuts payload size 2.2-4.6x across every format -- a real, confirmed
+  bandwidth win.
+- But *reduces* publish throughput for every format except Ion (which
+  comes out roughly breakeven). The window function + `GROUP BY` +
+  `jsonb_build_object()`/`jsonb_agg()` machinery needed to actually build
+  a batch in SQL has real cost of its own, and it outweighs the per-row
+  encoder saving for formats with less fixed per-document overhead to
+  amortize away (msgpack/cbor/beve especially). Ion benefits the most in
+  isolation (its mandatory local symbol table is the biggest fixed cost of
+  any format here) but even it only reaches breakeven once the SQL-side
+  construction cost is included.
+
+So: reach for `--batch-size` when you want fewer, smaller NATS messages,
+not as a throughput optimization -- with this jsonb-based implementation,
+it usually isn't one. Column alignment across a batch (`col1[i]` and
+`col2[i]` belonging to the same source row) is guaranteed by giving every
+column's `jsonb_agg()` an identical explicit `ORDER BY`; verified directly
+by inspecting decoded output, not just trusted.
+
 ## 🦀 Minimum supported Rust version
 
 - `Rust 1.82.0`

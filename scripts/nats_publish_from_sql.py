@@ -69,6 +69,40 @@ rollback-able. If you need a hard guarantee that nothing gets published
 unless the whole result set is clean, filter/validate the source data
 before pointing this at it either way.
 
+--batch-size N (opt-in, default 1 = off) groups up to N rows *within each
+subject* into one columnar NATS message - {"col1":[v,v,...],"col2":[v,v,...]}
+instead of a row object - built via jsonb_build_object()+jsonb_agg() then
+<fmt>_from_jsonb(), since pg_zerialize has no native multi-row columnar
+encoder (its rows_to_<fmt>() batch function produces an *array of row
+objects*, not columnar, and doesn't amortize the fixed per-document costs
+below at all). Column alignment across the batch (col1[i] and col2[i]
+belonging to the same source row) is guaranteed by giving every column's
+jsonb_agg() the same explicit ORDER BY - see build_batched_publish_query()'s
+docstring for why that's load-bearing, not cosmetic.
+
+Where this helps and where it doesn't - measured, not assumed, and the
+honest result cuts differently than a first look at the encoder-level cost
+suggests: profiling zerialize's writers directly (no SQL/jsonb involved,
+see the sibling investigation this tool grew out of) showed formats with a
+fixed per-document cost - Ion's mandatory local symbol table, FlexBuffers'
+key/value deduplication - lose that overhead almost entirely once
+amortized across a batch (Ion: ~5x smaller, ~2-8x faster in that isolated
+test). Real batching through this tool's actual jsonb-based SQL path tells
+a different story: --batch-size 100 against 200k real rows cut payload
+size 2.2-4.6x across every format (confirmed real, not estimated), but
+*reduced* publish throughput for every format except Ion, which came out
+roughly breakeven. The window function + GROUP BY + jsonb_build_object()/
+jsonb_agg() machinery needed to actually build a batch in SQL has real,
+substantial cost of its own, and for formats with less fixed per-document
+overhead to amortize away (msgpack, cbor, beve especially), that construction
+cost outweighs the encoder-level saving. So: use --batch-size when you want
+fewer, smaller NATS messages (bandwidth/message-count bound), not as a
+throughput optimization - it isn't reliably one, with this implementation.
+A native pg_zerialize columnar encoder (bypassing the jsonb intermediate
+entirely, the same way rows_to_<fmt>() bypasses it for row-array batching)
+would likely close that gap, but that's C++ work in pg_zerialize itself,
+not something this Python driver can do.
+
 Requires: psycopg (v3) - already available in this environment. Connects
 using standard libpq environment variables (PGHOST/PGPORT/PGUSER/
 PGPASSWORD/PGDATABASE/...), same as psql; override with --dsn if needed.
@@ -144,6 +178,19 @@ def parse_args():
     p.add_argument("--limit", type=int, default=None,
                     help="Cap the number of rows published (applied to --sql's result). "
                          "Strongly recommended for large tables.")
+    p.add_argument("--batch-size", type=int, default=1,
+                    help="Group up to N rows into a single columnar NATS message instead of "
+                         "one message per row (opt-in, default: 1 = off). Rows are batched "
+                         "*within* each subject (partitioned by --subject-columns) so a batch "
+                         "never mixes rows that would otherwise get different subjects - a "
+                         "batch's message is {\"col1\":[v,v,...], \"col2\":[v,v,...], ...} "
+                         "rather than a row object, built via jsonb_build_object()+jsonb_agg() "
+                         "then <fmt>_from_jsonb(). Measured (see module docstring for numbers): "
+                         "cuts payload size 2-5x across every format, but the SQL-side "
+                         "construction cost (window function + GROUP BY + jsonb) outweighs the "
+                         "encoder-level saving for most formats, so it's a bandwidth win, not "
+                         "reliably a throughput one - Ion is the exception, coming out roughly "
+                         "breakeven since it has the most fixed per-document cost to amortize.")
     p.add_argument("--dsn", default="",
                     help="libpq connection string/URI. Default: read standard PG* env vars, same as psql.")
     p.add_argument("--progress-every", type=int, default=10000,
@@ -393,6 +440,95 @@ def build_count_query(publish_query):
     ).format(publish_query)
 
 
+def introspect_columns(conn, user_sql):
+    # --batch-size needs the full column list up front to build a
+    # jsonb_build_object(col1, jsonb_agg(col1), col2, jsonb_agg(col2), ...)
+    # expression - LIMIT 0 evaluates no rows, just gets column names back
+    # via cursor.description. --limit isn't relevant here (and can't be
+    # combined with a second LIMIT 0 in one query) - this only needs
+    # column names, not a correctly-capped row count.
+    query = sql.SQL("SELECT * FROM ({}) AS t0 LIMIT 0").format(sql.SQL(user_sql))
+    with conn.cursor() as cur:
+        cur.execute(query)
+        return [d.name for d in cur.description]
+
+
+def build_batched_publish_query(user_sql, limit, fmt, subject_columns, all_columns, subject_expr, batch_size, verify):
+    """Groups up to `batch_size` rows *within each subject* (partitioned by
+    subject_columns, so a batch never spans rows that would get different
+    subjects) into one columnar document:
+    {"col1": [v, v, ...], "col2": [v, v, ...], ...} instead of a row object -
+    see build_subject_expr()'s and the module docstring's notes on why, and
+    the numbers behind it.
+
+    Column alignment matters here: jsonb_agg(col1 ORDER BY _e2e_seq) and
+    jsonb_agg(col2 ORDER BY _e2e_seq) are two independent aggregate calls in
+    the same GROUP BY, and Postgres does not otherwise guarantee they see
+    rows in the same order - without an explicit, *identical* ORDER BY on
+    every column's aggregate, col1[i] and col2[i] could silently end up
+    belonging to two different source rows. _e2e_seq (a stable per-subject
+    row_number()) is that shared order key.
+    """
+    # LIMIT must apply strictly before the window function below, not after
+    # it (window functions are computed before LIMIT in SQL's logical
+    # processing order) - an outer "... FROM (<user_sql>) AS src LIMIT n"
+    # would instead run row_number() OVER the *entire*, unlimited --sql
+    # result first and only take the first n of that, which for a large
+    # source table means a full sort of every row before LIMIT ever gets a
+    # chance to matter. Confirmed directly: this was a real, catastrophic
+    # bug during testing (row_number() OVER a 115M-row table instead of a
+    # 20,000-row --limit), not just a theoretical concern - fixed by
+    # nesting the LIMIT one level deeper than build_publish_query's
+    # (unbatched) same-looking pattern needs, since that path has no window
+    # function forcing full materialization to begin with.
+    limited = sql.SQL("SELECT * FROM ({}) AS src0{}").format(
+        sql.SQL(user_sql), sql.SQL(" LIMIT {}").format(sql.Literal(limit)) if limit else sql.SQL("")
+    )
+    subject_col_list = sql.SQL(", ").join(sql.Identifier(c) for c in subject_columns)
+
+    numbered = sql.SQL(
+        "SELECT *, row_number() OVER (PARTITION BY {}) AS _e2e_seq FROM ({}) AS src"
+    ).format(subject_col_list, limited)
+
+    batched = sql.SQL(
+        "SELECT *, ((_e2e_seq - 1) / {}) AS _e2e_batch_id FROM ({}) AS numbered"
+    ).format(sql.Literal(batch_size), numbered)
+
+    agg_pairs = [
+        sql.SQL("{}, jsonb_agg({} ORDER BY _e2e_seq)").format(sql.Literal(col), sql.Identifier(col))
+        for col in all_columns
+    ]
+    columnar_expr = sql.SQL("jsonb_build_object({})").format(sql.SQL(", ").join(agg_pairs))
+
+    grouped = sql.SQL(
+        "SELECT {subj}, count(*) AS _e2e_batch_rows, {from_jsonb}({columnar}) AS _e2e_payload "
+        "FROM ({batched}) AS b GROUP BY {subj}, _e2e_batch_id"
+    ).format(
+        subj=subject_col_list,
+        from_jsonb=sql.Identifier(f"{fmt}_from_jsonb"),
+        columnar=columnar_expr,
+        batched=batched,
+    )
+
+    cols = []
+    if verify:
+        cols.append(sql.SQL("{}(g._e2e_payload) AS _e2e_ref").format(sql.Identifier(f"{fmt}_to_jsonb")))
+    cols.append(sql.SQL("octet_length(g._e2e_payload) AS _e2e_bytes"))
+    cols.append(sql.SQL("g._e2e_batch_rows"))
+    cols.append(sql.SQL("nats_publish_binary({}, g._e2e_payload) AS _e2e_pub").format(subject_expr))
+    select_list = sql.SQL(", ").join(cols)
+    return sql.SQL("SELECT {} FROM ({}) AS g").format(select_list, grouped)
+
+
+def build_batched_count_query(publish_query):
+    # Same reasoning as build_count_query(), extended with sum(_e2e_batch_rows)
+    # since count(*) here counts *batches* (messages), not rows.
+    return sql.SQL(
+        "SELECT count(*), sum(_e2e_batch_rows), sum(_e2e_bytes), min(_e2e_bytes), max(_e2e_bytes) "
+        "FROM ({}) AS pub"
+    ).format(publish_query)
+
+
 def fmt_secs(s):
     return f"{s:.3f}s" if s is not None else "-"
 
@@ -413,18 +549,28 @@ def fmt_bytes(n):
     return f"{n:,.0f}TB"
 
 
-def run_one_format(conn, args, fmt, subject_columns):
+def run_one_format(conn, args, fmt, subject_columns, all_columns):
     """Publishes --sql once, encoded as `fmt`, optionally verifying via
     nats_tool. Never raises for an expected failure mode (bad SQL, bad
     subject data, verify mismatch, etc) - returns a dict with an "error"
     key set instead, so one format's failure doesn't stop a multi-format
     --format run from reporting the others.
+
+    `all_columns` is only used when --batch-size > 1 (introspected once in
+    main(), not per format - the column list doesn't depend on fmt).
     """
     metrics = {"format": fmt, "error": None}
+    batching = args.batch_size > 1
     subject_expr = build_subject_expr(
         subject_columns, args.subject_prefix, fmt, args.subject_format_suffix, args.on_bad_subject_value
     )
-    publish_query = build_publish_query(args.sql_stripped, args.limit, fmt, subject_expr, args.verify)
+    if batching:
+        publish_query = build_batched_publish_query(
+            args.sql_stripped, args.limit, fmt, subject_columns, all_columns,
+            subject_expr, args.batch_size, args.verify
+        )
+    else:
+        publish_query = build_publish_query(args.sql_stripped, args.limit, fmt, subject_expr, args.verify)
 
     dump_dir = tempfile.mkdtemp(prefix=f"nats_e2e_{fmt}_")
     dump_path = os.path.join(dump_dir, f"{fmt}.jsonl")
@@ -446,7 +592,8 @@ def run_one_format(conn, args, fmt, subject_columns):
                 print("  consumer subscribed")
 
         reference = None
-        published = 0
+        published = 0   # rows
+        batches = 0      # NATS messages - == published unless batching
         total_bytes = min_bytes = max_bytes = None
         t0 = time.perf_counter()
         if args.verify:
@@ -455,14 +602,27 @@ def run_one_format(conn, args, fmt, subject_columns):
             total_bytes = 0
             try:
                 with conn.cursor() as cur:
-                    for ref, nbytes, _pub in cur.stream(publish_query):
-                        reference.append(canonical(ref))
-                        total_bytes += nbytes
-                        min_bytes = nbytes if min_bytes is None else min(min_bytes, nbytes)
-                        max_bytes = nbytes if max_bytes is None else max(max_bytes, nbytes)
-                        published += 1
-                        if args.progress_every and published % args.progress_every == 0:
-                            print(f"  ...{published} published so far")
+                    if batching:
+                        for ref, nbytes, batch_rows, _pub in cur.stream(publish_query):
+                            reference.append(canonical(ref))
+                            total_bytes += nbytes
+                            min_bytes = nbytes if min_bytes is None else min(min_bytes, nbytes)
+                            max_bytes = nbytes if max_bytes is None else max(max_bytes, nbytes)
+                            prev = published
+                            published += batch_rows
+                            batches += 1
+                            if args.progress_every and published // args.progress_every > prev // args.progress_every:
+                                print(f"  ...{published} rows published so far ({batches} batches)")
+                    else:
+                        for ref, nbytes, _pub in cur.stream(publish_query):
+                            reference.append(canonical(ref))
+                            total_bytes += nbytes
+                            min_bytes = nbytes if min_bytes is None else min(min_bytes, nbytes)
+                            max_bytes = nbytes if max_bytes is None else max(max_bytes, nbytes)
+                            published += 1
+                            batches += 1
+                            if args.progress_every and published % args.progress_every == 0:
+                                print(f"  ...{published} published so far")
             except psycopg.Error as e:
                 metrics["error"] = f"publish failed after {published} row(s): {e}"
                 return metrics
@@ -470,17 +630,28 @@ def run_one_format(conn, args, fmt, subject_columns):
             print(f"== [{fmt}] 1. Publishing ==")
             try:
                 with conn.cursor() as cur:
-                    cur.execute(build_count_query(publish_query))
-                    published, total_bytes, _avg_bytes, min_bytes, max_bytes = cur.fetchone()
+                    if batching:
+                        cur.execute(build_batched_count_query(publish_query))
+                        batches, published, total_bytes, min_bytes, max_bytes = cur.fetchone()
+                        # sum(bigint) comes back as numeric (Decimal in
+                        # psycopg), unlike count(*)'s bigint (plain int) -
+                        # normalize both to int for downstream arithmetic.
+                        published = int(published) if published is not None else 0
+                        total_bytes = int(total_bytes) if total_bytes is not None else None
+                    else:
+                        cur.execute(build_count_query(publish_query))
+                        published, total_bytes, _avg_bytes, min_bytes, max_bytes = cur.fetchone()
+                        batches = published
             except psycopg.Error as e:
                 metrics["error"] = f"publish failed: {e}"
                 return metrics
         publish_secs = time.perf_counter() - t0
-        print(f"  published {published} message(s) in {fmt_secs(publish_secs)} "
+        batch_note = f" as {batches} batch(es)" if batching else ""
+        print(f"  published {published} row(s){batch_note} in {fmt_secs(publish_secs)} "
               f"({fmt_rate(published, publish_secs)}, {fmt_bytes(total_bytes)} total)")
 
         metrics.update(
-            rows=published, publish_secs=publish_secs,
+            rows=published, batches=batches, publish_secs=publish_secs,
             total_bytes=total_bytes,
             avg_bytes=(total_bytes / published) if published else None,
             min_bytes=min_bytes, max_bytes=max_bytes,
@@ -494,16 +665,17 @@ def run_one_format(conn, args, fmt, subject_columns):
             return metrics
 
         print(f"== [{fmt}] 3. Waiting for delivery ==")
+        # nats_tool's own stats count messages (batches), not rows.
         received_by_stats, receive_secs = wait_for_received_count(
-            log_path, published, args.timeout_secs
+            log_path, batches, args.timeout_secs
         )
         metrics["receive_secs"] = receive_secs
-        if received_by_stats < published:
-            print(f"  WARNING: only observed {received_by_stats}/{published} via consumer "
+        if received_by_stats < batches:
+            print(f"  WARNING: only observed {received_by_stats}/{batches} via consumer "
                   f"stats within {args.timeout_secs}s -- proceeding to compare anyway",
                   file=sys.stderr)
         else:
-            print(f"  all {published} observed received in {fmt_secs(receive_secs)} "
+            print(f"  all {batches} batch(es) observed received in {fmt_secs(receive_secs)} "
                   f"({fmt_rate(published, receive_secs)})")
 
         # grub mode has no self-exit: it only auto-unsubscribes after
@@ -531,14 +703,15 @@ def run_one_format(conn, args, fmt, subject_columns):
                     if line:
                         received.append(canonical(json.loads(line)))
 
+        unit = "batch(es)" if batching else "row(s)"
         print(f"== [{fmt}] 4. Comparing ==")
-        print(f"  reference: {len(reference)}, received: {len(received)}")
+        print(f"  reference: {len(reference)} {unit}, received: {len(received)} {unit}")
 
         exp_sorted = sorted(reference)
         act_sorted = sorted(received)
         if exp_sorted == act_sorted:
-            print(f"  PASS: all {len(reference)} rows received and decoded correctly "
-                  "(unordered content match)")
+            print(f"  PASS: all {len(reference)} {unit} ({published} row(s)) received and "
+                  "decoded correctly (unordered content match)")
             metrics["verify_result"] = "PASS"
             return metrics
 
@@ -546,8 +719,8 @@ def run_one_format(conn, args, fmt, subject_columns):
         act_counts = Counter(received)
         missing = exp_counts - act_counts
         extra = act_counts - exp_counts
-        print(f"  FAIL: {sum(missing.values())} row(s) missing/mismatched, "
-              f"{sum(extra.values())} unexpected row(s) received")
+        print(f"  FAIL: {sum(missing.values())} {unit} missing/mismatched, "
+              f"{sum(extra.values())} unexpected {unit} received")
         for i, s in enumerate(list(missing.elements())[:3]):
             print(f"    missing[{i}]: {s[:300]}")
         for i, s in enumerate(list(extra.elements())[:3]):
@@ -564,9 +737,12 @@ def run_one_format(conn, args, fmt, subject_columns):
             shutil.rmtree(dump_dir, ignore_errors=True)
 
 
-def print_comparison(results, verify):
+def print_comparison(results, verify, batching):
     print("\n== Format comparison ==")
-    headers = ["format", "rows", "avg bytes", "publish", "publish rate"]
+    headers = ["format", "rows"]
+    if batching:
+        headers += ["batches"]
+    headers += ["avg bytes/row", "publish", "publish rate"]
     if verify:
         headers += ["receive", "receive rate", "verify"]
     rows = []
@@ -574,9 +750,10 @@ def print_comparison(results, verify):
         if r.get("error") and r.get("rows") is None:
             rows.append([r["format"], "ERROR: " + r["error"]])
             continue
-        row = [
-            r["format"],
-            str(r["rows"]),
+        row = [r["format"], str(r["rows"])]
+        if batching:
+            row += [str(r.get("batches", "-"))]
+        row += [
             fmt_bytes(r["avg_bytes"]),
             fmt_secs(r["publish_secs"]),
             fmt_rate(r["rows"], r["publish_secs"]),
@@ -614,8 +791,18 @@ def main():
     if args.nats_topic and len(formats) > 1:
         sys.exit("error: --nats-topic can't be used with more than one --format "
                  "(each format needs its own topic to avoid collisions)")
+    if args.batch_size < 1:
+        sys.exit("error: --batch-size must be >= 1")
 
     conn = psycopg.connect(args.dsn, autocommit=True)
+
+    all_columns = None
+    if args.batch_size > 1:
+        all_columns = introspect_columns(conn, args.sql_stripped)
+        missing = [c for c in subject_columns if c not in all_columns]
+        if missing:
+            sys.exit(f"error: --subject-columns {missing} not found in --sql's result columns "
+                     f"{all_columns}")
 
     if len(formats) > 1:
         # Whichever format runs first pays the cost of pulling --sql's rows
@@ -640,14 +827,14 @@ def main():
     for i, fmt in enumerate(formats):
         if len(formats) > 1:
             print(f"\n### format {i + 1}/{len(formats)}: {fmt} ###")
-        r = run_one_format(conn, args, fmt, subject_columns)
+        r = run_one_format(conn, args, fmt, subject_columns, all_columns)
         results.append(r)
         if r.get("error"):
             any_error = True
             print(f"  ERROR: {r['error']}", file=sys.stderr)
 
     if len(formats) > 1:
-        print_comparison(results, args.verify)
+        print_comparison(results, args.verify, args.batch_size > 1)
 
     if args.metrics_json:
         with open(args.metrics_json, "w") as f:
