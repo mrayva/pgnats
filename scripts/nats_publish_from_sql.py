@@ -880,21 +880,37 @@ def main():
                      f"{all_columns}")
 
     if len(formats) > 1:
-        # Whichever format runs first pays the cost of pulling --sql's rows
-        # into Postgres's shared_buffers/the OS page cache from disk; every
-        # format after it reads the same rows already warm. Confirmed
-        # directly: re-running a format alone, after the others had already
-        # scanned the same table, published measurably faster than it did
-        # going first in a --format all run. One warm-up pass here (same
-        # --sql/--limit, no format-specific work) means every format's
-        # timing starts from the same cache state, not whichever position
-        # it happened to run in.
-        print("Warming cache (reading --sql's rows once before timing any format)...")
+        # Whichever format runs first pays three one-time costs that have
+        # nothing to do with that format's encoder: (1) pulling --sql's rows
+        # into Postgres's shared_buffers/the OS page cache from disk, (2)
+        # this backend's first-ever call into pg_zerialize.so (dlopen/
+        # relocation/static-init, charged once per process), and (3) - the
+        # biggest of the three, confirmed directly at ~6.5ms for the first
+        # nats_publish_text()/nats_publish_binary() call in a fresh session
+        # vs ~0.1ms after - pgnats lazily establishing its NATS connection
+        # on first use. All three were conflated at first as "msgpack is
+        # slower than the others" purely because it happened to run first in
+        # one comparison; rerunning the same comparison with a different
+        # format listed first shifted the "slowest" result to whichever one
+        # moved to the front, proving none of it was intrinsic to any one
+        # format. Warming all three here - one plain data read, one
+        # throwaway pg_zerialize call (msgpack chosen arbitrarily; every
+        # format lives in the same .so, so any one call loads it for all of
+        # them), one throwaway nats_publish_text() to a disposable subject -
+        # means every format's timing starts from the same warm state, not
+        # whichever position it happened to run in.
+        print("Warming cache, pg_zerialize.so, and the NATS connection (before timing any format)...")
         limit_clause = sql.SQL(" LIMIT {}").format(sql.Literal(args.limit)) if args.limit else sql.SQL("")
         with conn.cursor() as cur:
             cur.execute(sql.SQL("SELECT count(*) FROM ({}) AS t{}").format(
                 sql.SQL(args.sql_stripped), limit_clause
             ))
+            cur.fetchone()
+            cur.execute(sql.SQL("SELECT octet_length(row_to_msgpack(t)) FROM ({}) AS t LIMIT 1").format(
+                sql.SQL(args.sql_stripped)
+            ))
+            cur.fetchone()
+            cur.execute("SELECT nats_publish_text('_e2e_warmup.discard', 'warmup')")
             cur.fetchone()
 
     results = []
