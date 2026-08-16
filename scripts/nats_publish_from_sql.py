@@ -231,8 +231,33 @@ def default_topic(subject_columns, prefix, fmt, format_suffix):
     return f"{prefix}.{topic}" if prefix else topic
 
 
+# JSON's number type doesn't distinguish int from float, but pg_zerialize's
+# own <fmt>_to_jsonb() and zerialize's translate<JSON> (what nats_tool's
+# --json decode uses) don't always agree on which one to render a
+# whole-number double as - e.g. a `double precision` column holding exactly
+# 36 comes back as the bare integer "36" from <fmt>_to_jsonb() but as "36.0"
+# from nats_tool. Both correctly hold the same IEEE-754 value; only the
+# JSON text differs. Comparing canonical strings without normalizing this
+# first reports a false mismatch for every whole-number double column -
+# confirmed directly against real NYSE trade data (Trade Price). 2**53 is
+# the largest magnitude a float can represent every integer up to exactly,
+# so this only folds int into float where doing so can't itself lose
+# precision and manufacture a *false* match.
+_MAX_EXACT_FLOAT_INT = 2**53
+
+
+def _normalize_numbers(obj):
+    if isinstance(obj, dict):
+        return {k: _normalize_numbers(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalize_numbers(v) for v in obj]
+    if isinstance(obj, int) and not isinstance(obj, bool) and abs(obj) <= _MAX_EXACT_FLOAT_INT:
+        return float(obj)
+    return obj
+
+
 def canonical(obj):
-    return json.dumps(obj, sort_keys=True, ensure_ascii=False)
+    return json.dumps(_normalize_numbers(obj), sort_keys=True, ensure_ascii=False)
 
 
 def start_consumer(nats_tool, topic, fmt, dump_path, log_file):
