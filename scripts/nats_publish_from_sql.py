@@ -577,6 +577,24 @@ def main():
 
     conn = psycopg.connect(args.dsn, autocommit=True)
 
+    if len(formats) > 1:
+        # Whichever format runs first pays the cost of pulling --sql's rows
+        # into Postgres's shared_buffers/the OS page cache from disk; every
+        # format after it reads the same rows already warm. Confirmed
+        # directly: re-running a format alone, after the others had already
+        # scanned the same table, published measurably faster than it did
+        # going first in a --format all run. One warm-up pass here (same
+        # --sql/--limit, no format-specific work) means every format's
+        # timing starts from the same cache state, not whichever position
+        # it happened to run in.
+        print("Warming cache (reading --sql's rows once before timing any format)...")
+        limit_clause = sql.SQL(" LIMIT {}").format(sql.Literal(args.limit)) if args.limit else sql.SQL("")
+        with conn.cursor() as cur:
+            cur.execute(sql.SQL("SELECT count(*) FROM ({}) AS t{}").format(
+                sql.SQL(args.sql_stripped), limit_clause
+            ))
+            cur.fetchone()
+
     results = []
     any_error = False
     for i, fmt in enumerate(formats):
