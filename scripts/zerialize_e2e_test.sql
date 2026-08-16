@@ -1,8 +1,17 @@
 -- Fixture for scripts/zerialize_e2e_test.sh: a representative "arbitrary
 -- table" with a wide type spread (ints of every width, floats including
--- +/-Infinity, bool, text with quotes/backslashes/unicode, jsonb, bytea,
--- timestamp, numeric, a text array, and a composite column), plus edge
--- cases (an all-NULL row, empty string/array/bytea).
+-- +/-Infinity and NaN, bool, text with quotes/backslashes/unicode, jsonb,
+-- bytea, timestamp, numeric, a text array, and a composite column), plus
+-- edge cases (an all-NULL row, empty string/array/bytea).
+--
+-- Row 3 (+/-Infinity) and row 5 (NaN) are deliberate regression coverage,
+-- not filler: this exact fixture caught a real bug on its first run --
+-- every pg_zerialize format failed to decode row 3 end to end, because
+-- zerialize::translate<JSON> (what nats_tool's --format decode uses)
+-- threw for the *entire* message on any non-finite double, not just that
+-- field. Fixed upstream in zerialize (json.hpp's double_()); NaN
+-- specifically wasn't covered by that original repro, so row 5 exists to
+-- make sure it doesn't regress independently of +/-Infinity.
 --
 -- Not meant to be exhaustive on its own -- pg_zerialize's own regression
 -- suite already covers that. This just needs enough variety that a
@@ -48,7 +57,12 @@ INSERT INTO pgnats_zerialize_demo VALUES
  '{"a":[1,2,{"b":true}]}'::jsonb, decode('00FF10', 'hex'),
  '2038-01-19 03:14:07'::timestamp, -999.99, ARRAY['x', 'y', 'z'],
  ROW('Tokyo', '100-0001')::pgnats_zerialize_demo_addr),
-(4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+(4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+(5, 1::smallint, 1::integer, 1::bigint,
+ 'NaN'::real, 'NaN'::double precision, false, 'nan row',
+ '{"note":"nan floats"}'::jsonb, decode('CAFE', 'hex'),
+ '2024-06-15 12:00:00'::timestamp, 3.14159, ARRAY['n', 'a', 'n'],
+ ROW('NaNCity', '99999')::pgnats_zerialize_demo_addr);
 
 -- Bulk-generated rows, deterministic so re-runs are reproducible.
 INSERT INTO pgnats_zerialize_demo
@@ -67,4 +81,4 @@ SELECT
     (g * 1.1)::numeric,
     ARRAY['tag' || g, 'tag' || (g + 1)],
     ROW('City' || g, lpad(g::text, 5, '0'))::pgnats_zerialize_demo_addr
-FROM generate_series(5, 30) g;
+FROM generate_series(6, 30) g;
