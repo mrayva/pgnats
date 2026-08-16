@@ -29,20 +29,33 @@ non-unique column values can't be used to correlate individual rows back
 to a source identity in the general case, so content, not position, is
 what's verified).
 
-Streaming, not materializing: --sql is wrapped in a single query, fetched
-row-by-row via psycopg's cursor.stream() (libpq single-row mode - no real
-server-side DECLARE CURSOR, so no held-open transaction either), that
-computes each row's payload once and both publishes it and (with
---verify) records its jsonb reference from that same evaluation - nothing
-about --sql is copied into a temp table first, so this scales to a query
-returning millions of rows without duplicating them server-side or
-buffering the whole result set client-side. The tradeoff: a bad subject-column
-value is only caught at the row it occurs on (see "safety" in
-build_subject_expr()'s docstring below) - rows the server already
-streamed past by then have already been published, since NATS publish
-side effects aren't transactional/rollback-able. If you need a hard
-guarantee that nothing gets published unless the whole result set is
-clean, filter/validate the source data before pointing this at it.
+Streaming, not materializing: --sql is wrapped in a single query that
+computes each row's payload once (row_to_<fmt>) and both publishes it and
+(with --verify) projects its jsonb reference from that same evaluation -
+nothing about --sql is copied into a temp table first, so this scales to
+a query returning millions of rows without duplicating them server-side.
+How that query is run differs by mode, since only --verify actually needs
+row data back in Python:
+
+  - Without --verify: one plain execute() wrapping the whole thing in
+    SELECT count(*) FROM (...) - Postgres does the counting, this script
+    never touches a row. Fast and simple, but no progress feedback while
+    it runs, and a failure partway through can't report how many rows had
+    already published by then (only that some number of the earlier ones
+    did - NATS publish is not transactional, see below).
+  - With --verify: fetched row-by-row via psycopg's cursor.stream()
+    (libpq single-row mode - no real server-side DECLARE CURSOR, no
+    held-open transaction), since the reference list has to end up in
+    Python either way for the comparison. This is also what
+    --progress-every reports against.
+
+The tradeoff either way: a bad subject-column value is only caught at the
+row it occurs on (see "safety" in build_subject_expr()'s docstring below)
+- rows the server already evaluated by then have already been published,
+since NATS publish side effects aren't transactional/rollback-able. If
+you need a hard guarantee that nothing gets published unless the whole
+result set is clean, filter/validate the source data before pointing
+this at it.
 
 Requires: psycopg (v3) - already available in this environment. Connects
 using standard libpq environment variables (PGHOST/PGPORT/PGUSER/
@@ -103,7 +116,9 @@ def parse_args():
     p.add_argument("--dsn", default="",
                     help="libpq connection string/URI. Default: read standard PG* env vars, same as psql.")
     p.add_argument("--progress-every", type=int, default=10000,
-                    help="Print a running count every N published rows, 0 to disable (default: 10000).")
+                    help="Print a running count every N published rows, 0 to disable (default: "
+                         "10000). Only applies with --verify: without it, publishing is a "
+                         "single statement with no row-by-row visibility into progress.")
     p.add_argument("--verify", action="store_true",
                     help="After publishing, spin up a nats_tool consumer and cross-check its "
                          "decoded output against pg_zerialize's own decode of the same rows.")
@@ -220,7 +235,7 @@ def wait_for_subscribed(log_path, timeout_secs):
     return False
 
 
-def build_stream_query(user_sql, limit, fmt, subject_expr, verify):
+def build_publish_query(user_sql, limit, fmt, subject_expr, verify):
     # payload (row_to_<fmt>) is computed exactly once per row here and
     # reused below for both the jsonb reference (--verify only) and the
     # actual publish call, rather than invoking the encoder twice.
@@ -238,6 +253,13 @@ def build_stream_query(user_sql, limit, fmt, subject_expr, verify):
     return sql.SQL("SELECT {} FROM ({}) AS t").format(select_list, src)
 
 
+def build_count_query(publish_query):
+    # No row data is needed back for the plain-publish (no --verify) path -
+    # just how many were published - so that path doesn't stream row-by-row
+    # at all: one statement, one round trip, Postgres does the counting.
+    return sql.SQL("SELECT count(*) FROM ({}) AS pub").format(publish_query)
+
+
 def main():
     args = parse_args()
     fmt = validate_format(args.format)
@@ -251,7 +273,7 @@ def main():
     subject_expr = build_subject_expr(
         subject_columns, args.subject_prefix, fmt, args.subject_format_suffix
     )
-    query = build_stream_query(user_sql, args.limit, fmt, subject_expr, args.verify)
+    publish_query = build_publish_query(user_sql, args.limit, fmt, subject_expr, args.verify)
 
     conn = psycopg.connect(args.dsn, autocommit=True)
 
@@ -278,19 +300,34 @@ def main():
             else:
                 print("  consumer subscribed")
 
-        print(f"== {'2' if args.verify else '1'}. Streaming --sql and publishing as {fmt} ==")
-        reference = [] if args.verify else None
+        reference = None
         published = 0
-        try:
-            with conn.cursor() as cur:
-                for row in cur.stream(query):
-                    if args.verify:
+        if args.verify:
+            # Row data is needed back (for the jsonb reference), so this
+            # path streams row-by-row via cursor.stream() - also what gives
+            # --progress-every something to report incrementally on.
+            print(f"== 2. Streaming --sql and publishing as {fmt} ==")
+            reference = []
+            try:
+                with conn.cursor() as cur:
+                    for row in cur.stream(publish_query):
                         reference.append(canonical(row[0]))
-                    published += 1
-                    if args.progress_every and published % args.progress_every == 0:
-                        print(f"  ...{published} published so far")
-        except psycopg.Error as e:
-            sys.exit(f"error: publish failed after {published} row(s): {e}")
+                        published += 1
+                        if args.progress_every and published % args.progress_every == 0:
+                            print(f"  ...{published} published so far")
+            except psycopg.Error as e:
+                sys.exit(f"error: publish failed after {published} row(s): {e}")
+        else:
+            # No row data is needed back at all here - just a count - so
+            # this is one statement, one round trip, no row-by-row client
+            # iteration: Postgres does the counting, not this script.
+            print(f"== 1. Publishing as {fmt} ==")
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(build_count_query(publish_query))
+                    published = cur.fetchone()[0]
+            except psycopg.Error as e:
+                sys.exit(f"error: publish failed: {e}")
         print(f"  published {published} message(s)")
 
         if published == 0:
