@@ -112,6 +112,27 @@ cargo pgrx package --no-default-features --features kv sub
 cargo pgrx test
 ```
 
+### 🔁 Zerialize End-to-End Test
+
+`scripts/zerialize_e2e_test.sh` publishes real Postgres rows through pgnats to
+NATS in every [pg_zerialize](https://github.com/mrayva/pg_zerialize) binary
+wire format (msgpack, cbor, zera, flexbuffers, ion, bson, beve), consumes
+them back with [nats_asio](https://github.com/mrayva/nats_asio)'s `nats_tool`
+(a decoder independent of pg_zerialize's own), and structurally compares the
+result against pg_zerialize's own decode of the same rows -- proving the
+full publish/transport/decode chain doesn't lose or corrupt anything, for
+every format.
+
+```sh
+./scripts/zerialize_e2e_test.sh
+```
+
+Requires a running NATS server, pgnats and pg_zerialize both installed with
+the foreign server configured (see Configuration above), and `nats_tool`
+built (set `NATS_TOOL=<path>` if it isn't at the default
+`~/nats_asio/build/bin/nats_tool`). Runs automatically in CI on every push
+via `.github/workflows/zerialize-e2e.yml`.
+
 ## 🦀 Minimum supported Rust version
 
 - `Rust 1.82.0`
