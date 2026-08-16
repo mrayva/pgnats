@@ -133,6 +133,32 @@ built (set `NATS_TOOL=<path>` if it isn't at the default
 `~/nats_asio/build/bin/nats_tool`). Runs automatically in CI on every push
 via `.github/workflows/zerialize-e2e.yml`.
 
+### 🔎 Ad Hoc: Publish Any Query to NATS
+
+`scripts/nats_publish_from_sql.py` is a general-purpose companion to the
+fixed end-to-end test above: instead of a hardcoded fixture, point it at
+any SELECT statement, choose which result columns build the per-row NATS
+subject, and choose the pg_zerialize wire format. Not wired into CI (it's
+for ad hoc testing against real tables), and requires `psycopg` (v3).
+
+```sh
+./scripts/nats_publish_from_sql.py \
+    --sql 'SELECT * FROM nyse_eqy_us_all_trade_20260105' \
+    --subject-columns 'Exchange,Symbol' \
+    --format msgpack \
+    --limit 1000 \
+    --verify
+```
+
+Publishes each row's whole tuple, msgpack-encoded, to a subject built from
+that row's own `Exchange`/`Symbol` values (e.g. `N.AAPL`). `--verify` spins
+up an `nats_tool` consumer and cross-checks its decoded output against
+pg_zerialize's own decode of the same rows, as an unordered multiset
+(subject values built from arbitrary columns aren't necessarily unique per
+row, so content -- not subject -- is what's compared). Run with `--help`
+for the full option list (`--subject-prefix`, `--nats-topic`, `--dsn`,
+timeouts, etc).
+
 ## 🦀 Minimum supported Rust version
 
 - `Rust 1.82.0`

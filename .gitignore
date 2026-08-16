@@ -4,3 +4,4 @@
 /tests/certs
 
 /scripts/out/
+/scripts/__pycache__/
