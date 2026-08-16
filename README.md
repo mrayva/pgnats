@@ -161,11 +161,12 @@ unique per row, so content -- not subject -- is what's compared). Run with
 `--dsn`, timeouts, etc).
 
 `--sql` is never materialized into a table: it's wrapped in a single
-streaming query (a server-side cursor, fetched in batches) that computes
-each row's payload once and both publishes it and (with `--verify`)
-records its jsonb reference from that same evaluation, so this scales to
-a query returning millions of rows without copying them server-side
-first. The tradeoff: a subject-column value containing whitespace or a
+query, fetched row-by-row via psycopg's `cursor.stream()` (libpq
+single-row mode), that computes each row's payload once and both
+publishes it and (with `--verify`) records its jsonb reference from that
+same evaluation, so this scales to a query returning millions of rows
+without copying them server-side or buffering the whole result set
+client-side. The tradeoff: a subject-column value containing whitespace or a
 NATS wildcard character (`*`/`>`) is only caught at the row it occurs on
 -- rows the server already streamed past by then have already been
 published, since NATS publish isn't transactional. Filter/validate the

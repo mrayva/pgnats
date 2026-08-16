@@ -29,12 +29,14 @@ non-unique column values can't be used to correlate individual rows back
 to a source identity in the general case, so content, not position, is
 what's verified).
 
-Streaming, not materializing: --sql is wrapped in a single query (a
-server-side cursor, fetched in batches) that computes each row's payload
-once and both publishes it and (with --verify) records its jsonb
-reference from that same evaluation - nothing about --sql is copied into
-a temp table first, so this scales to a query returning millions of rows
-without duplicating them server-side. The tradeoff: a bad subject-column
+Streaming, not materializing: --sql is wrapped in a single query, fetched
+row-by-row via psycopg's cursor.stream() (libpq single-row mode - no real
+server-side DECLARE CURSOR, so no held-open transaction either), that
+computes each row's payload once and both publishes it and (with
+--verify) records its jsonb reference from that same evaluation - nothing
+about --sql is copied into a temp table first, so this scales to a query
+returning millions of rows without duplicating them server-side or
+buffering the whole result set client-side. The tradeoff: a bad subject-column
 value is only caught at the row it occurs on (see "safety" in
 build_subject_expr()'s docstring below) - rows the server already
 streamed past by then have already been published, since NATS publish
@@ -251,10 +253,7 @@ def main():
     )
     query = build_stream_query(user_sql, args.limit, fmt, subject_expr, args.verify)
 
-    # Server-side (named) cursors need an open transaction block for their
-    # whole lifetime, so this can't use autocommit - committed explicitly
-    # once the cursor is done, below.
-    conn = psycopg.connect(args.dsn)
+    conn = psycopg.connect(args.dsn, autocommit=True)
 
     dump_dir = tempfile.mkdtemp(prefix="nats_e2e_")
     dump_path = os.path.join(dump_dir, f"{fmt}.jsonl")
@@ -283,10 +282,8 @@ def main():
         reference = [] if args.verify else None
         published = 0
         try:
-            with conn.cursor(name="_e2e_cursor") as cur:
-                cur.itersize = 1000
-                cur.execute(query)
-                for row in cur:
+            with conn.cursor() as cur:
+                for row in cur.stream(query):
                     if args.verify:
                         reference.append(canonical(row[0]))
                     published += 1
@@ -294,7 +291,6 @@ def main():
                         print(f"  ...{published} published so far")
         except psycopg.Error as e:
             sys.exit(f"error: publish failed after {published} row(s): {e}")
-        conn.commit()
         print(f"  published {published} message(s)")
 
         if published == 0:
