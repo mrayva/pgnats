@@ -143,6 +143,18 @@ jobs:
           cat /tmp/nats-server.log
           exit 1
 
+      # NATS_ASIO_BUILD_SAMPLES=ON below pulls in NATS_ASIO_ENABLE_ARROW
+      # (default ON), which calls find_package(Arrow CONFIG REQUIRED) -
+      # libarrow-dev isn't in Ubuntu's default apt repos, hence Apache's own
+      # apt source. Same fix as nats_asio's own CI (.github/workflows/ci.yml).
+      - name: Install libarrow-dev
+        run: |
+          sudo apt-get install -y -V ca-certificates lsb-release wget
+          wget -q "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
+          sudo apt-get install -y -V "./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
+          sudo apt-get update
+          sudo apt-get install -y -V libarrow-dev
+
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11.6
         with:
