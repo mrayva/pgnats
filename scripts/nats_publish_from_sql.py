@@ -110,6 +110,36 @@ smaller - msgpack 1.8x, ion 4.9x (2.2x vs the old jsonb-batched path),
 bson 1.5x, zera 2.0x, beve 2.0x, flexbuffers 2.4x. Pass --batch-encoding
 jsonb to reproduce the old (size-win-only) behavior for comparison.
 
+Column *name* length matters too, specifically in row mode (--batch-size
+1, the default): every message re-serializes every field's key string,
+with no batch to amortize it across - so a schema with verbose column
+names pays that cost on every single row, every single message. Measured
+directly (see scripts/nyse_trade_short_cols_view.sql), 20,000 real NYSE
+rows, row mode, --format all, comparing the real column names (some up
+to 38 characters, e.g. "Trade Reporting Facility TRF Timestamp") against
+a view aliasing every column to 2 letters:
+
+  format       bytes/row (long->short)  size cut  publish rate gain
+  -----------  -----------------------  --------  -----------------
+  msgpack      358B -> 131B              2.73x     +26%
+  cbor         362B -> 131B              2.76x     +19%
+  zera         648B -> 425B              1.53x     +7%
+  flexbuffers  539B -> 296B              1.82x     +15%
+  ion          399B -> 160B              2.49x     +20%
+  bson         413B -> 183B              2.26x     +15%
+  beve         369B -> 141B              2.62x     +13%
+
+msgpack/cbor benefited the most - neither deduplicates keys within a
+document at all, so shrinking key strings has maximal proportional
+impact. zera and flexbuffers benefited the least - both already intern/
+deduplicate keys internally, so a chunk of their per-row overhead lives
+elsewhere (shape/type metadata) and doesn't scale with raw key-string
+length. Throughput gains are real but consistently smaller than the
+byte savings, the same pattern --workers' own numbers below show: row-
+mode publish throughput is dominated by the per-message publish() round
+trip itself, not encoding cost, so a smaller payload helps without being
+the whole story.
+
 --workers N (opt-in, default 1 = off) tests connection-level parallelism
 alongside per-message encoding cost: splits --sql's rows across N
 independent Postgres connections, each publishing its own physical
