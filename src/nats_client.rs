@@ -17,6 +17,45 @@ use crate::{
     utils::{extract_headers, resolve_config_path, FromBytes, ToBytes},
 };
 
+// Kept comfortably under async-nats's own default max-in-flight-acks
+// semaphore capacity (5,000, jetstream::context::ContextBuilder's
+// semaphore_capacity default) - draining here is what returns permits to
+// that semaphore, so this bound has to be reached well before the
+// semaphore itself would be exhausted, or publish_stream_async() would
+// block waiting on a permit nothing is freeing. See
+// NatsClient::publish_stream_async()'s doc for what happens if it isn't.
+const PENDING_STREAM_ACK_LIMIT: usize = 1_000;
+
+/// Awaits a batch of pipelined JetStream acks concurrently, reporting every
+/// failure (not just the first) so a caller sees the full extent of a bad
+/// batch instead of just its first row.
+async fn drain_stream_acks(
+    pending: Vec<async_nats::jetstream::context::PublishAckFuture>,
+) -> anyhow::Result<u64> {
+    let count = pending.len() as u64;
+
+    let results =
+        futures::future::join_all(pending.into_iter().map(std::future::IntoFuture::into_future))
+            .await;
+
+    let errors: Vec<String> = results
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.err().map(|e| format!("#{i}: {e}")))
+        .collect();
+
+    if !errors.is_empty() {
+        anyhow::bail!(
+            "{} of {} pipelined JetStream publishes failed to ack: {}",
+            errors.len(),
+            count,
+            errors.join("; ")
+        );
+    }
+
+    Ok(count)
+}
+
 pub struct NatsClient {
     connection: Option<Client>,
     jetstream: Option<Context>,
@@ -24,6 +63,16 @@ pub struct NatsClient {
     cached_object_stores: HashMap<String, ObjectStore>,
     current_config: Option<Config>,
     config_fetcher: fn() -> Config,
+    // Acks pipelined by publish_stream_async(), awaited (and verified) by
+    // flush_stream_acks(). async_nats's own PublishAckFuture::drop() hands
+    // pending acks off to a background "acker" task that silently discards
+    // both the actual result and any error (see spawn_acker() in
+    // async-nats's jetstream/context.rs: `timeout(..., subscription).await.ok()`
+    // then unconditionally drops the permit) - that's exactly what
+    // publish_stream() does today by discarding the future it gets back.
+    // Keeping the future alive here instead is what makes a later flush
+    // able to see a real failure rather than silently losing the row.
+    pending_stream_acks: Vec<async_nats::jetstream::context::PublishAckFuture>,
 }
 
 impl NatsClient {
@@ -35,6 +84,7 @@ impl NatsClient {
             jetstream: None,
             cached_buckets: HashMap::new(),
             cached_object_stores: HashMap::new(),
+            pending_stream_acks: Vec::new(),
         }
     }
 
@@ -96,6 +146,20 @@ impl NatsClient {
         Ok(result.payload.to_vec())
     }
 
+    /// Publishes and waits for this message's actual JetStream ack.
+    ///
+    /// `Context::publish()`/`publish_with_headers()` don't themselves wait
+    /// for the ack - they return a `PublishAckFuture` that must be awaited
+    /// a second time to get it. This used to be discarded here (`let _ =
+    /// js.publish(...).await?`), which only confirmed the message was
+    /// handed to the connection, not that the stream accepted it -
+    /// dropping a `PublishAckFuture` hands it to async-nats's own
+    /// background "acker" task (see `spawn_acker` in
+    /// `async-nats::jetstream::context`), which waits for the ack (or
+    /// times out) and then unconditionally discards the result either way.
+    /// A failed or timed-out ack was therefore never surfaced here despite
+    /// this function's own doc promising "JetStream persistence and
+    /// delivery guarantees."
     pub async fn publish_stream(
         &mut self,
         subject: impl ToString,
@@ -107,15 +171,79 @@ impl NatsClient {
         let headers = headers.map(extract_headers).transpose()?;
         let js = self.get_jetstream().await?;
 
-        if let Some(headers) = headers {
-            let _ = js
-                .publish_with_headers(subject, headers, message.into())
-                .await?;
+        let ack = if let Some(headers) = headers {
+            js.publish_with_headers(subject, headers, message.into())
+                .await?
         } else {
-            let _ = js.publish(subject, message.into()).await?;
+            js.publish(subject, message.into()).await?
+        };
+        ack.await?;
+
+        Ok(())
+    }
+
+    /// Like [`Self::publish_stream`], but returns as soon as the message is
+    /// handed to the connection instead of waiting for this one message's
+    /// JetStream ack. The ack is not discarded, though - it's queued in
+    /// `pending_stream_acks` so [`Self::flush_stream_acks`] can verify it
+    /// later. Callers must flush before treating the publish as durable;
+    /// nothing here calls flush automatically.
+    ///
+    /// async-nats gates in-flight (unacked) publishes on its own semaphore,
+    /// default capacity 5,000 - `Context::publish()`'s returned
+    /// `PublishAckFuture` only releases its permit when it's either awaited
+    /// or dropped (dropping hands it to async-nats's own background
+    /// "acker" task, which awaits it on our behalf). Holding every future
+    /// in `pending_stream_acks` without ever awaiting or dropping any of
+    /// them - which is what this function did before this comment was
+    /// added - starves that release path entirely: past the semaphore's
+    /// capacity, every subsequent publish blocks forever on
+    /// `acquire_owned().await`, and that block happens inside a foreign
+    /// Rust future `block_on()`'d from C, which is not a point Postgres's
+    /// own interrupt handling can reach - confirmed directly, not
+    /// theoretical: `pg_cancel_backend`/`pg_terminate_backend` both failed
+    /// to stop a backend wedged this way, and recovering it took `kill -9`
+    /// on the backend process, which is a hard, unclean stop. Draining well
+    /// under that 5,000 capacity here is what keeps this function from
+    /// ever being able to reach that state.
+    pub async fn publish_stream_async(
+        &mut self,
+        subject: impl ToString,
+        message: impl ToBytes,
+        headers: Option<serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        let subject = subject.to_string();
+        let message: Vec<u8> = message.to_bytes()?;
+        let headers = headers.map(extract_headers).transpose()?;
+        let js = self.get_jetstream().await?;
+
+        let ack = if let Some(headers) = headers {
+            js.publish_with_headers(subject, headers, message.into())
+                .await?
+        } else {
+            js.publish(subject, message.into()).await?
+        };
+
+        self.pending_stream_acks.push(ack);
+
+        if self.pending_stream_acks.len() >= PENDING_STREAM_ACK_LIMIT {
+            let pending = std::mem::take(&mut self.pending_stream_acks);
+            drain_stream_acks(pending).await?;
         }
 
         Ok(())
+    }
+
+    /// Awaits every ack queued by [`Self::publish_stream_async`] on this
+    /// connection since the last flush (whether that was an explicit call
+    /// here or the automatic drain inside [`Self::publish_stream_async`]
+    /// once `PENDING_STREAM_ACK_LIMIT` was reached), concurrently. Returns
+    /// the number flushed by *this* call - not a running total, and not
+    /// necessarily every publish since the backend connected, since an
+    /// automatic drain may already have flushed and cleared earlier ones.
+    pub async fn flush_stream_acks(&mut self) -> anyhow::Result<u64> {
+        let pending = std::mem::take(&mut self.pending_stream_acks);
+        drain_stream_acks(pending).await
     }
 
     pub async fn invalidate_connection(&mut self) {

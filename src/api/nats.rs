@@ -100,6 +100,73 @@ impl_nats_publish! {
     jsonb, pgrx::JsonB
 }
 
+/// Publishes a raw binary message to a JetStream stream *without* waiting
+/// for that message's individual acknowledgment - for pipelined,
+/// high-throughput publishing where the per-message round trip of
+/// [`nats_publish_binary_stream`] is the bottleneck.
+///
+/// This is not fire-and-forget: the message still requires an existing
+/// stream covering the subject, and its ack is queued on this backend
+/// connection to be checked later. **It is not durable until you call
+/// [`nats_publish_stream_flush`]** - nothing here awaits, retries, or
+/// verifies the ack on its own, and pending acks do not survive past the
+/// backend session. Call `nats_publish_stream_flush()` before your
+/// transaction commits (or before treating the publish as done at all) to
+/// get the actual delivery guarantee.
+///
+/// # Arguments
+/// * `subject` - NATS subject to publish to (must be covered by an existing stream)
+/// * `payload` - Binary data to publish as `Vec<u8>`
+/// * `headers` *(optional)* – Key-value headers to include in the message, as `jsonb`
+///
+/// # SQL Usage
+/// ```sql
+/// SELECT nats_publish_binary_stream_async('events.raw', payload) FROM big_table;
+/// SELECT nats_publish_stream_flush();  -- required for durability
+/// ```
+#[pg_extern]
+pub fn nats_publish_binary_stream_async(
+    subject: &str,
+    payload: Vec<u8>,
+    headers: ::pgrx::default!(Option<pgrx::JsonB>, "NULL"),
+) -> anyhow::Result<()> {
+    CTX.with_borrow_mut(|ctx| {
+        ctx.rt.block_on(async {
+            let res = ctx
+                .nats_connection
+                .publish_stream_async(subject, payload, headers.map(|h| h.0))
+                .await;
+            tokio::task::yield_now().await;
+            res
+        })
+    })
+}
+
+/// Awaits every JetStream acknowledgment queued by
+/// [`nats_publish_binary_stream_async`] on this backend connection since
+/// the last flush, concurrently, and errors (aborting the calling
+/// transaction) if any of them failed - including one whose ack timed out,
+/// or whose subject was never actually covered by a stream. This is the
+/// only place [`nats_publish_binary_stream_async`]'s durability guarantee
+/// is actually checked; skipping it means those publishes were sent but
+/// never verified.
+///
+/// # Returns
+/// * The number of acks flushed
+///
+/// # SQL Usage
+/// ```sql
+/// SELECT nats_publish_stream_flush();
+/// ```
+#[pg_extern]
+pub fn nats_publish_stream_flush() -> anyhow::Result<i64> {
+    CTX.with_borrow_mut(|ctx| {
+        ctx.rt
+            .block_on(async { ctx.nats_connection.flush_stream_acks().await })
+    })
+    .map(|v| v.try_into().unwrap_or(i64::MAX))
+}
+
 impl_nats_request! {
     /// Performs a binary request/response operation with NATS
     ///
