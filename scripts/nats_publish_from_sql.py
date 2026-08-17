@@ -154,6 +154,38 @@ same way the single-connection path would) and --verify (one shared
 nats_tool consumer per format; each worker streams and contributes its
 own slice of the decoded reference list, merged before comparing).
 
+--jetstream (opt-in, off by default) publishes via JetStream
+(nats_publish_binary_stream) instead of core NATS pub/sub
+(nats_publish_binary) - persisted, replayable messages rather than
+fire-and-forget - and, with --verify, consumes via nats_tool's js_grub
+mode instead of grub. Everything above (row mode, --batch-size/
+--batch-encoding, --workers) works the same way underneath; --jetstream
+only changes the transport.
+
+Requires --subject-prefix. This tool creates one JetStream stream per
+--format, covering a subject *pattern* built the same way
+default_topic() already builds the --verify consumer's subscribe topic
+for core mode: one '*' per --subject-columns column plus the format as
+the last token (e.g. --subject-prefix trades --subject-columns
+'Sequence Number' --format msgpack -> stream pattern
+'trades.*.msgpack', matching concrete published subjects like
+'trades.156341.msgpack'). Confirmed directly against a real nats-server
+(not assumed) that a stream subject pattern whose *first* token is a
+bare wildcard is rejected outright - "subjects that overlap with
+jetstream api require no-ack to be true" - so a --subject-prefix isn't
+optional here the way it is for core NATS mode; --subject-columns alone
+(no prefix) would produce a pattern like '*.msgpack', which JetStream
+refuses to create a stream for.
+
+The stream itself is created (or updated, if it already exists) by
+shelling out to `nats_tool pub --js --create_stream` once per format
+before publishing starts, reusing nats_tool's own tested JetStream
+stream-create/update logic (js_stream_utils.hpp) rather than
+reimplementing the JS API's create/update/info request-response
+protocol here. Consumers are ephemeral-named (a random suffix per run)
+to avoid colliding with a leftover durable consumer from an earlier run
+of this tool against the same stream.
+
 Requires: psycopg (v3) - already available in this environment. Connects
 using standard libpq environment variables (PGHOST/PGPORT/PGUSER/
 PGPASSWORD/PGDATABASE/...), same as psql; override with --dsn if needed.
@@ -265,6 +297,20 @@ def parse_args():
                          "--batch-size (each worker batches its own share) and --verify (one "
                          "shared consumer per format; each worker's decoded reference rows are "
                          "merged before comparing).")
+    p.add_argument("--jetstream", action="store_true",
+                    help="Publish via JetStream (nats_publish_binary_stream) instead of core "
+                         "NATS pub/sub (nats_publish_binary), and (with --verify) consume via "
+                         "nats_tool's js_grub mode instead of grub. Requires --subject-prefix - "
+                         "see the module docstring for why a JetStream stream's subject pattern "
+                         "can't start with a bare wildcard token.")
+    p.add_argument("--js-stream-prefix", default=None,
+                    help="Base name for the JetStream stream(s) this creates, one per --format "
+                         "(<PREFIX>_<FORMAT>, e.g. 'TRADES_MSGPACK'). Default: --subject-prefix, "
+                         "uppercased with non-alphanumeric runs collapsed to '_'. Only meaningful "
+                         "with --jetstream.")
+    p.add_argument("--js-create-timeout-secs", type=int, default=15,
+                    help="Max seconds to wait for the one-time JetStream stream create/update "
+                         "call per format (default: 15). Only meaningful with --jetstream.")
     p.add_argument("--dsn", default="",
                     help="libpq connection string/URI. Default: read standard PG* env vars, same as psql.")
     p.add_argument("--progress-every", type=int, default=10000,
@@ -402,6 +448,150 @@ def default_topic(subject_columns, prefix, fmt, format_suffix):
     return f"{prefix}.{topic}" if prefix else topic
 
 
+_NON_ALNUM_RUN_RE = re.compile(r"[^A-Za-z0-9]+")
+
+
+def js_stream_name(stream_prefix, subject_prefix, fmt):
+    """One JetStream stream name per --format per run, e.g.
+    'TRADES_MSGPACK_A1B2C3D4' for stream_prefix=None/subject_prefix=
+    'trades'/fmt='msgpack'. Stream names can't contain '.' (NATS reserves
+    it as JetStream's own subject separator, same reasoning as
+    BAD_SUBJECT_TOKEN_PATTERN above), so this collapses any run of
+    non-alphanumeric characters to a single '_' rather than passing
+    --subject-prefix through unchanged.
+
+    The uuid suffix matters, not just cosmetic uniqueness: JetStream
+    persists messages, and a fresh consumer's default DeliverPolicy
+    replays the *entire* stream from the beginning (js_grub has no
+    delivery-policy flag to ask for only-new-messages) - confirmed
+    directly, not assumed: reusing a deterministic stream name across two
+    --verify runs made the second run's consumer receive both runs' rows,
+    reported as spurious "extra" mismatches even though nothing was
+    actually wrong. run_one_format()/run_one_format_parallel() also
+    delete the stream in their `finally` block once done, but the suffix
+    is real insurance against a stream surviving an interrupted run
+    (SIGKILL, crash) and silently polluting the next one.
+    """
+    base = stream_prefix if stream_prefix else subject_prefix
+    unique = f"{base}_{fmt}_{uuid.uuid4().hex[:8]}"
+    return _NON_ALNUM_RUN_RE.sub("_", unique).upper().strip("_")
+
+
+def _js_api_request(nats_tool, subject, payload_obj, timeout_secs):
+    """One request/reply round trip against a `$JS.API.*` subject via
+    `nats_tool req`, parsing the reply JSON out of its stdout. `nats_tool
+    req` prints each reply as one line shaped "[<reply-subject>] <json>"
+    (confirmed directly: "[_INBOX.Uj0sRgQ3100] {...}"), interleaved with
+    its own "[2026-... ] [console] [info] ..." log lines - rather than
+    assume the exact reply-subject prefix is always "_INBOX" (an
+    implementation detail of nats_tool's own inbox naming that could
+    change), this instead skips lines that look like nats_tool's own
+    timestamped log lines and tries to JSON-parse the "<...>] " remainder
+    of every other line, taking the first one that parses. Raises
+    RuntimeError with a diagnostic message on timeout, no reply, or no
+    parseable line - callers treat that as a real failure (see
+    ensure_js_stream()), not a silently-empty result.
+    """
+    try:
+        proc = subprocess.run(
+            [nats_tool, "req", "--topic", subject, "--data", json.dumps(payload_obj)],
+            capture_output=True, text=True, timeout=timeout_secs,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"nats_tool req {subject!r} timed out after {timeout_secs}s")
+    out = proc.stdout or ""
+    for line in out.splitlines():
+        if re.match(r"^\[\d{4}-\d{2}-\d{2}", line):
+            continue
+        _, bracket, body = line.partition("] ")
+        if not bracket:
+            continue
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            continue
+    raise RuntimeError(f"no parseable reply received for {subject!r} within {timeout_secs}s "
+                        f"(nats_tool output: {out.strip()[:300]!r})")
+
+
+def ensure_js_stream(nats_tool, stream_name, subject_pattern, timeout_secs):
+    """One-time JetStream stream create/update, via direct `$JS.API.STREAM.*`
+    admin requests (STREAM.INFO, then CREATE or UPDATE) - the exact same
+    protocol nats_tool's own `pub --js --create_stream` uses internally
+    (js_stream_utils.hpp::ensure_stream_for_subject), reimplemented here
+    rather than shelled out to, specifically to avoid that path's side
+    effect: `pub --create_stream` also publishes its one message to the
+    stream's own data subject as an ordinary side effect of being pub
+    mode, which - confirmed directly, not a theoretical concern - a
+    --verify consumer subscribing to that same wildcarded subject pattern
+    then legitimately receives and decodes (garbage, since it's not a
+    real <fmt>-encoded payload), reported as one spurious "extra"
+    mismatch. A pure admin request against $JS.API.STREAM.* never touches
+    the data subject at all, so there's nothing for a consumer to see.
+
+    `subject_pattern` is a wildcarded subject *pattern* (e.g.
+    'trades.*.msgpack', the same shape default_topic() already builds),
+    not one row's literal subject - see the module docstring for why a
+    bare leading wildcard token is rejected by JetStream itself.
+
+    Returns (ok: bool, message: str) - the caller decides what to do with
+    a failure rather than this raising past its own boundary, matching
+    this tool's existing "return an error, don't raise" convention for
+    expected-failure-mode operations.
+    """
+    try:
+        info = _js_api_request(nats_tool, f"$JS.API.STREAM.INFO.{stream_name}", {}, timeout_secs)
+    except RuntimeError as e:
+        return False, str(e)
+
+    exists = "config" in info and "error" not in info
+    if exists:
+        subjects = info["config"].get("subjects", [])
+        if subject_pattern in subjects or f"{subject_pattern}.>" in subjects:
+            return True, f"stream '{stream_name}' already covers '{subject_pattern}'"
+        config = dict(info["config"])
+        config["subjects"] = subjects + [subject_pattern]
+        create_subject = f"$JS.API.STREAM.UPDATE.{stream_name}"
+        verb = "update"
+    else:
+        config = {
+            "name": stream_name, "subjects": [subject_pattern], "retention": "limits",
+            "storage": "file", "max_msgs": -1, "max_bytes": -1, "max_age": 0,
+            "max_msg_size": -1, "discard": "old", "num_replicas": 1,
+        }
+        create_subject = f"$JS.API.STREAM.CREATE.{stream_name}"
+        verb = "create"
+
+    try:
+        response = _js_api_request(nats_tool, create_subject, config, timeout_secs)
+    except RuntimeError as e:
+        return False, str(e)
+
+    if "error" in response:
+        err = response["error"]
+        return False, f"failed to {verb} stream '{stream_name}': {err.get('description', err)}"
+    return True, f"stream '{stream_name}' {verb}d for '{subject_pattern}'"
+
+
+def delete_js_stream(nats_tool, stream_name, timeout_secs):
+    """Best-effort cleanup counterpart to ensure_js_stream() - called from
+    run_one_format()'s/run_one_format_parallel()'s `finally` block once a
+    --jetstream run is done, the same way --workers unconditionally drops
+    its own throwaway materialized table. Never raises: a failed delete
+    (server unreachable, stream already gone) just leaves the stream
+    behind for manual cleanup rather than masking whatever real error is
+    already propagating out of the `finally` block's caller.
+    """
+    try:
+        response = _js_api_request(nats_tool, f"$JS.API.STREAM.DELETE.{stream_name}", {}, timeout_secs)
+    except RuntimeError as e:
+        print(f"  WARNING: failed to delete JetStream stream '{stream_name}': {e}", file=sys.stderr)
+        return
+    if "error" in response:
+        print(f"  WARNING: failed to delete JetStream stream '{stream_name}': "
+              f"{response['error'].get('description', response['error'])}", file=sys.stderr)
+
+
 # JSON's number type doesn't distinguish int from float, but pg_zerialize's
 # own <fmt>_to_jsonb() and zerialize's translate<JSON> (what nats_tool's
 # --json decode uses) don't always agree on which one to render a
@@ -431,31 +621,73 @@ def canonical(obj):
     return json.dumps(_normalize_numbers(obj), sort_keys=True, ensure_ascii=False)
 
 
-def start_consumer(nats_tool, topic, fmt, dump_path, log_file):
-    cmd = [
-        nats_tool, "grub",
-        "--topic", topic,
-        "--format", fmt,
-        "--json",
-        "--stats_interval", "1",
-        # grub mode never self-exits on message count anyway (only auto-
-        # unsubscribes - see the shutdown comment below), and an exact
-        # count isn't known ahead of time in this streaming design, so this
-        # is just a large placeholder - BUT it has to be present and > 0:
-        # mode_runners.hpp's on_connected only logs "subscribed to ..." at
-        # all (what wait_for_subscribed() polls for) when max_msgs > 0.
-        "--max_msgs", str(2**31 - 1),
-        "--dump", dump_path,
-    ]
+def canonical_dumped_line(line, jetstream):
+    """js_grub's --dump line shape wraps the decoded value in JetStream
+    delivery metadata - {"subject":...,"stream":...,"seq":...,"payload":
+    <decoded value>} (message_output.hpp's json_prefix_fields/
+    json_suffix_fields, deliberately different from core grub's bare
+    decoded-value-per-line, since a JetStream message genuinely carries
+    that extra metadata a core NATS message doesn't) - confirmed directly
+    against a real js_grub run, not assumed from source. Unwrap it before
+    comparing against the reference list, which only ever holds the
+    decoded row/batch value itself.
+    """
+    obj = json.loads(line)
+    if jetstream:
+        obj = obj.get("payload")
+    return canonical(obj)
+
+
+def start_consumer(nats_tool, topic, fmt, dump_path, log_file, jetstream=False,
+                    js_stream=None, js_consumer=None):
+    if jetstream:
+        # js_grub has no --max_msgs (js_grubber.hpp's constructor doesn't
+        # take one - it never auto-unsubscribes by count, same as grub in
+        # practice): shutdown is SIGTERM-only either way, see the
+        # consumer.terminate() comment below. --consumer/--durable use the
+        # same ephemeral-per-run name - see run_one_format()'s comment on
+        # why this doesn't reuse a fixed durable name across runs.
+        cmd = [
+            nats_tool, "js_grub",
+            "--topic", topic,
+            "--stream", js_stream,
+            "--consumer", js_consumer,
+            "--durable", js_consumer,
+            "--auto_ack",
+            "--format", fmt,
+            "--json",
+            "--stats_interval", "1",
+            "--dump", dump_path,
+        ]
+    else:
+        cmd = [
+            nats_tool, "grub",
+            "--topic", topic,
+            "--format", fmt,
+            "--json",
+            "--stats_interval", "1",
+            # grub mode never self-exits on message count anyway (only auto-
+            # unsubscribes - see the shutdown comment below), and an exact
+            # count isn't known ahead of time in this streaming design, so this
+            # is just a large placeholder - BUT it has to be present and > 0:
+            # mode_runners.hpp's on_connected only logs "subscribed to ..." at
+            # all (what wait_for_subscribed() polls for) when max_msgs > 0.
+            "--max_msgs", str(2**31 - 1),
+            "--dump", dump_path,
+        ]
     return subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
 
 
-def wait_for_subscribed(log_path, timeout_secs):
+def wait_for_subscribed(log_path, timeout_secs, jetstream=False):
+    # js_grub logs "JetStream subscription active: ..." on ready, never
+    # "subscribed to ..." (that's core grub's own ready line) - confirmed
+    # directly against a running js_grub process, not assumed from source.
+    marker = "JetStream subscription active" if jetstream else "subscribed to"
     deadline = time.monotonic() + timeout_secs
     while time.monotonic() < deadline:
         try:
             with open(log_path) as f:
-                if "subscribed to" in f.read():
+                if marker in f.read():
                     return True
         except FileNotFoundError:
             pass
@@ -495,7 +727,7 @@ def wait_for_received_count(log_path, expected, timeout_secs):
     return total, time.monotonic() - start
 
 
-def build_publish_query(user_sql, limit, fmt, subject_expr, verify):
+def build_publish_query(user_sql, limit, fmt, subject_expr, verify, publish_fn="nats_publish_binary"):
     # payload (row_to_<fmt>) is computed exactly once per row here and
     # reused below for the jsonb reference (--verify only), the payload
     # size, and the actual publish call, rather than invoking the encoder
@@ -508,7 +740,7 @@ def build_publish_query(user_sql, limit, fmt, subject_expr, verify):
     if verify:
         cols.append(sql.SQL("{}(t._e2e_payload) AS _e2e_ref").format(sql.Identifier(f"{fmt}_to_jsonb")))
     cols.append(sql.SQL("octet_length(t._e2e_payload) AS _e2e_bytes"))
-    cols.append(sql.SQL("nats_publish_binary({}, t._e2e_payload) AS _e2e_pub").format(subject_expr))
+    cols.append(sql.SQL("{}({}, t._e2e_payload) AS _e2e_pub").format(sql.Identifier(publish_fn), subject_expr))
     select_list = sql.SQL(", ").join(cols)
     return sql.SQL("SELECT {} FROM ({}) AS t").format(select_list, src)
 
@@ -537,7 +769,8 @@ def introspect_columns(conn, user_sql):
         return [d.name for d in cur.description]
 
 
-def build_batched_publish_query(user_sql, limit, fmt, subject_columns, all_columns, subject_expr, batch_size, verify):
+def build_batched_publish_query(user_sql, limit, fmt, subject_columns, all_columns, subject_expr, batch_size, verify,
+                                 publish_fn="nats_publish_binary"):
     """Groups up to `batch_size` rows *within each subject* (partitioned by
     subject_columns, so a batch never spans rows that would get different
     subjects) into one columnar document:
@@ -599,12 +832,13 @@ def build_batched_publish_query(user_sql, limit, fmt, subject_columns, all_colum
         cols.append(sql.SQL("{}(g._e2e_payload) AS _e2e_ref").format(sql.Identifier(f"{fmt}_to_jsonb")))
     cols.append(sql.SQL("octet_length(g._e2e_payload) AS _e2e_bytes"))
     cols.append(sql.SQL("g._e2e_batch_rows"))
-    cols.append(sql.SQL("nats_publish_binary({}, g._e2e_payload) AS _e2e_pub").format(subject_expr))
+    cols.append(sql.SQL("{}({}, g._e2e_payload) AS _e2e_pub").format(sql.Identifier(publish_fn), subject_expr))
     select_list = sql.SQL(", ").join(cols)
     return sql.SQL("SELECT {} FROM ({}) AS g").format(select_list, grouped)
 
 
-def build_native_columnar_publish_query(user_sql, limit, fmt, subject_columns, subject_expr, batch_size, verify):
+def build_native_columnar_publish_query(user_sql, limit, fmt, subject_columns, subject_expr, batch_size, verify,
+                                         publish_fn="nats_publish_binary"):
     """Same grouping/partitioning as build_batched_publish_query() (batches
     within each subject, never spanning rows that'd get different
     subjects), but builds the batch document via pg_zerialize's native
@@ -653,7 +887,7 @@ def build_native_columnar_publish_query(user_sql, limit, fmt, subject_columns, s
         cols.append(sql.SQL("{}(g._e2e_payload) AS _e2e_ref").format(sql.Identifier(f"{fmt}_to_jsonb")))
     cols.append(sql.SQL("octet_length(g._e2e_payload) AS _e2e_bytes"))
     cols.append(sql.SQL("g._e2e_batch_rows"))
-    cols.append(sql.SQL("nats_publish_binary({}, g._e2e_payload) AS _e2e_pub").format(subject_expr))
+    cols.append(sql.SQL("{}({}, g._e2e_payload) AS _e2e_pub").format(sql.Identifier(publish_fn), subject_expr))
     select_list = sql.SQL(", ").join(cols)
     return sql.SQL("SELECT {} FROM ({}) AS g").format(select_list, grouped)
 
@@ -771,15 +1005,18 @@ def build_worker_source_sql(conn, table_name, page_lo, page_hi):
 def build_worker_publish_query(conn, args, fmt, subject_columns, subject_expr, all_columns,
                                 table_name, page_lo, page_hi, batching, verify):
     worker_sql = build_worker_source_sql(conn, table_name, page_lo, page_hi)
+    publish_fn = "nats_publish_binary_stream" if args.jetstream else "nats_publish_binary"
     if batching and args.batch_encoding == "native":
         return build_native_columnar_publish_query(
-            worker_sql, None, fmt, subject_columns, subject_expr, args.batch_size, verify
+            worker_sql, None, fmt, subject_columns, subject_expr, args.batch_size, verify,
+            publish_fn=publish_fn
         )
     if batching:
         return build_batched_publish_query(
-            worker_sql, None, fmt, subject_columns, all_columns, subject_expr, args.batch_size, verify
+            worker_sql, None, fmt, subject_columns, all_columns, subject_expr, args.batch_size, verify,
+            publish_fn=publish_fn
         )
-    return build_publish_query(worker_sql, None, fmt, subject_expr, verify)
+    return build_publish_query(worker_sql, None, fmt, subject_expr, verify, publish_fn=publish_fn)
 
 
 def _unpack_worker_row(row, batching, verify):
@@ -876,9 +1113,23 @@ def run_one_format_parallel(conn, args, fmt, subject_columns, all_columns):
         subject_columns, args.subject_prefix, fmt, args.subject_format_suffix, args.on_bad_subject_value
     )
 
+    js_stream = js_consumer = None
     dump_dir = dump_path = log_path = None
     consumer = None
     try:
+        if args.jetstream:
+            js_stream = js_stream_name(args.js_stream_prefix, args.subject_prefix, fmt)
+            js_consumer = f"e2e_{fmt}_{uuid.uuid4().hex[:8]}"
+            js_topic_pattern = default_topic(
+                subject_columns, args.subject_prefix, fmt, args.subject_format_suffix
+            )
+            print(f"== [{fmt}] 0. Ensuring JetStream stream {js_stream!r} covers {js_topic_pattern!r} ==")
+            ok, out = ensure_js_stream(args.nats_tool, js_stream, js_topic_pattern, args.js_create_timeout_secs)
+            if not ok:
+                metrics["error"] = f"failed to ensure JetStream stream {js_stream!r}: {out.strip()[-500:]}"
+                return metrics
+            print(f"  stream ready")
+
         print(f"== [{fmt}] 1. Materializing --sql's rows ({args.workers} workers) ==")
         total_rows = materialize_partitioned(conn, args.sql_stripped, args.limit, table_name)
         bounds = ctid_page_bounds(conn, table_name, args.workers)
@@ -896,8 +1147,9 @@ def run_one_format_parallel(conn, args, fmt, subject_columns, all_columns):
             print(f"== [{fmt}] {step}. Starting nats_tool consumer (topic={topic!r}) ==")
             step += 1
             with open(log_path, "w") as log_file:
-                consumer = start_consumer(args.nats_tool, topic, fmt, dump_path, log_file)
-            if not wait_for_subscribed(log_path, args.connect_wait_secs):
+                consumer = start_consumer(args.nats_tool, topic, fmt, dump_path, log_file,
+                                           jetstream=args.jetstream, js_stream=js_stream, js_consumer=js_consumer)
+            if not wait_for_subscribed(log_path, args.connect_wait_secs, jetstream=args.jetstream):
                 print(f"  WARNING: consumer did not confirm subscription within "
                       f"{args.connect_wait_secs}s -- proceeding anyway", file=sys.stderr)
             else:
@@ -982,7 +1234,7 @@ def run_one_format_parallel(conn, args, fmt, subject_columns, all_columns):
                 for line in f:
                     line = line.strip()
                     if line:
-                        received.append(canonical(json.loads(line)))
+                        received.append(canonical_dumped_line(line, args.jetstream))
 
         unit = "batch(es)" if batching else "row(s)"
         print(f"== [{fmt}] {step}. Comparing ==")
@@ -1022,6 +1274,8 @@ def run_one_format_parallel(conn, args, fmt, subject_columns, all_columns):
                 print(f"  (dump kept at {dump_dir})")
             else:
                 shutil.rmtree(dump_dir, ignore_errors=True)
+        if js_stream:
+            delete_js_stream(args.nats_tool, js_stream, args.js_create_timeout_secs)
 
 
 def run_one_format(conn, args, fmt, subject_columns, all_columns):
@@ -1042,33 +1296,50 @@ def run_one_format(conn, args, fmt, subject_columns, all_columns):
     subject_expr = build_subject_expr(
         subject_columns, args.subject_prefix, fmt, args.subject_format_suffix, args.on_bad_subject_value
     )
+    publish_fn = "nats_publish_binary_stream" if args.jetstream else "nats_publish_binary"
     if batching and args.batch_encoding == "native":
         publish_query = build_native_columnar_publish_query(
             args.sql_stripped, args.limit, fmt, subject_columns,
-            subject_expr, args.batch_size, args.verify
+            subject_expr, args.batch_size, args.verify, publish_fn=publish_fn
         )
     elif batching:
         publish_query = build_batched_publish_query(
             args.sql_stripped, args.limit, fmt, subject_columns, all_columns,
-            subject_expr, args.batch_size, args.verify
+            subject_expr, args.batch_size, args.verify, publish_fn=publish_fn
         )
     else:
-        publish_query = build_publish_query(args.sql_stripped, args.limit, fmt, subject_expr, args.verify)
+        publish_query = build_publish_query(args.sql_stripped, args.limit, fmt, subject_expr, args.verify,
+                                             publish_fn=publish_fn)
 
     dump_dir = tempfile.mkdtemp(prefix=f"nats_e2e_{fmt}_")
     dump_path = os.path.join(dump_dir, f"{fmt}.jsonl")
     log_path = os.path.join(dump_dir, f"{fmt}.log")
     consumer = None
+    js_stream = js_consumer = None
 
     try:
+        if args.jetstream:
+            js_stream = js_stream_name(args.js_stream_prefix, args.subject_prefix, fmt)
+            js_consumer = f"e2e_{fmt}_{uuid.uuid4().hex[:8]}"
+            js_topic_pattern = default_topic(
+                subject_columns, args.subject_prefix, fmt, args.subject_format_suffix
+            )
+            print(f"== [{fmt}] 0. Ensuring JetStream stream {js_stream!r} covers {js_topic_pattern!r} ==")
+            ok, out = ensure_js_stream(args.nats_tool, js_stream, js_topic_pattern, args.js_create_timeout_secs)
+            if not ok:
+                metrics["error"] = f"failed to ensure JetStream stream {js_stream!r}: {out.strip()[-500:]}"
+                return metrics
+            print(f"  stream ready")
+
         if args.verify:
             topic = args.nats_topic or default_topic(
                 subject_columns, args.subject_prefix, fmt, args.subject_format_suffix
             )
             print(f"== [{fmt}] 1. Starting nats_tool consumer (topic={topic!r}) ==")
             with open(log_path, "w") as log_file:
-                consumer = start_consumer(args.nats_tool, topic, fmt, dump_path, log_file)
-            if not wait_for_subscribed(log_path, args.connect_wait_secs):
+                consumer = start_consumer(args.nats_tool, topic, fmt, dump_path, log_file,
+                                           jetstream=args.jetstream, js_stream=js_stream, js_consumer=js_consumer)
+            if not wait_for_subscribed(log_path, args.connect_wait_secs, jetstream=args.jetstream):
                 print(f"  WARNING: consumer did not confirm subscription within "
                       f"{args.connect_wait_secs}s -- proceeding anyway", file=sys.stderr)
             else:
@@ -1185,7 +1456,7 @@ def run_one_format(conn, args, fmt, subject_columns, all_columns):
                 for line in f:
                     line = line.strip()
                     if line:
-                        received.append(canonical(json.loads(line)))
+                        received.append(canonical_dumped_line(line, args.jetstream))
 
         unit = "batch(es)" if batching else "row(s)"
         print(f"== [{fmt}] 4. Comparing ==")
@@ -1219,6 +1490,8 @@ def run_one_format(conn, args, fmt, subject_columns, all_columns):
             print(f"  (dump kept at {dump_dir})")
         else:
             shutil.rmtree(dump_dir, ignore_errors=True)
+        if js_stream:
+            delete_js_stream(args.nats_tool, js_stream, args.js_create_timeout_secs)
 
 
 def print_comparison(results, verify, batching):
@@ -1269,9 +1542,13 @@ def main():
     args.sql_stripped = validate_sql(args.sql)
     subject_columns = parse_subject_columns(args.subject_columns)
 
-    if args.verify and not os.access(args.nats_tool, os.X_OK):
-        sys.exit(f"error: --verify given but nats_tool not found/executable at {args.nats_tool} "
-                 "(build ~/nats_asio first, or pass --nats-tool)")
+    if (args.verify or args.jetstream) and not os.access(args.nats_tool, os.X_OK):
+        reason = "--verify" if args.verify else "--jetstream"
+        sys.exit(f"error: {reason} given but nats_tool not found/executable at {args.nats_tool} "
+                 "(build ~/nats_asio first, or pass --nats-tool)"
+                 + (" (--jetstream shells out to nats_tool pub --create_stream even without "
+                    "--verify, to ensure the JetStream stream exists before publishing)"
+                    if args.jetstream and not args.verify else ""))
     if args.nats_topic and len(formats) > 1:
         sys.exit("error: --nats-topic can't be used with more than one --format "
                  "(each format needs its own topic to avoid collisions)")
@@ -1279,6 +1556,12 @@ def main():
         sys.exit("error: --batch-size must be >= 1")
     if args.workers < 1:
         sys.exit("error: --workers must be >= 1")
+    if args.jetstream and not args.subject_prefix:
+        sys.exit("error: --jetstream requires --subject-prefix - a JetStream stream's subject "
+                 "pattern can't start with a bare wildcard token (confirmed directly against "
+                 "nats-server: \"subjects that overlap with jetstream api require no-ack to be "
+                 "true\"), and --subject-columns alone always produces one (e.g. '*.msgpack'). "
+                 "See --jetstream's help for the full explanation.")
 
     conn = psycopg.connect(args.dsn, autocommit=True)
 
