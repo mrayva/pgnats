@@ -216,6 +216,27 @@ protocol here. Consumers are ephemeral-named (a random suffix per run)
 to avoid colliding with a leftover durable consumer from an earlier run
 of this tool against the same stream.
 
+--jetstream-async (opt-in, requires --jetstream, pgnats >= 1.1.1)
+switches the publish_fn to nats_publish_binary_stream_async(), which
+returns as soon as a message is handed to the connection instead of
+blocking on that one message's ack, plus one nats_publish_stream_flush()
+call per connection at the end to verify every queued ack (included in
+the reported publish time - an async publish isn't durable until
+flushed). This matters because nats_publish_binary_stream() (used
+without --jetstream-async) turned out to be effectively round-trip-bound
+per message: measured directly, a single connection went from 4,427
+rows/s (blocking, genuinely awaiting each ack) to 207,900 rows/s
+(pipelined via --jetstream-async) publishing the identical 500,000 real
+rows, all still fully acked and durable (0 loss both ways) - a ~47x gain
+on one connection alone, well past this tool's own best *64-connection*
+blocking-mode aggregate (~142k rows/s) from before this flag existed.
+Requires pgnats >= 1.1.1: earlier versions don't have
+nats_publish_binary_stream_async()/nats_publish_stream_flush() (and,
+worth knowing regardless of this flag, pgnats < 1.1.1's
+nats_publish_binary_stream() silently discarded a message's ack instead
+of checking it - a failed or timed-out JetStream publish was never
+surfaced as an error before that fix).
+
 Requires: psycopg (v3) - already available in this environment. Connects
 using standard libpq environment variables (PGHOST/PGPORT/PGUSER/
 PGPASSWORD/PGDATABASE/...), same as psql; override with --dsn if needed.
@@ -333,6 +354,14 @@ def parse_args():
                          "nats_tool's js_grub mode instead of grub. Requires --subject-prefix - "
                          "see the module docstring for why a JetStream stream's subject pattern "
                          "can't start with a bare wildcard token.")
+    p.add_argument("--jetstream-async", action="store_true",
+                    help="With --jetstream, publish via nats_publish_binary_stream_async "
+                         "(pgnats >= 1.1.1) instead of the blocking nats_publish_binary_stream - "
+                         "pipelines publishes without waiting for each one's individual ack, then "
+                         "verifies all of them at once via a single nats_publish_stream_flush() "
+                         "call per connection at the end (included in the reported publish time, "
+                         "since that flush is what actually proves durability - an unflushed async "
+                         "publish is not confirmed). Requires --jetstream.")
     p.add_argument("--js-stream-prefix", default=None,
                     help="Base name for the JetStream stream(s) this creates, one per --format "
                          "(<PREFIX>_<FORMAT>, e.g. 'TRADES_MSGPACK'). Default: --subject-prefix, "
@@ -1032,10 +1061,18 @@ def build_worker_source_sql(conn, table_name, page_lo, page_hi):
     return composed.as_string(conn)
 
 
+def _select_publish_fn(args):
+    if args.jetstream and args.jetstream_async:
+        return "nats_publish_binary_stream_async"
+    if args.jetstream:
+        return "nats_publish_binary_stream"
+    return "nats_publish_binary"
+
+
 def build_worker_publish_query(conn, args, fmt, subject_columns, subject_expr, all_columns,
                                 table_name, page_lo, page_hi, batching, verify):
     worker_sql = build_worker_source_sql(conn, table_name, page_lo, page_hi)
-    publish_fn = "nats_publish_binary_stream" if args.jetstream else "nats_publish_binary"
+    publish_fn = _select_publish_fn(args)
     if batching and args.batch_encoding == "native":
         return build_native_columnar_publish_query(
             worker_sql, None, fmt, subject_columns, subject_expr, args.batch_size, verify,
@@ -1067,7 +1104,7 @@ def _unpack_worker_row(row, batching, verify):
     return ref, nbytes, batch_rows
 
 
-def run_parallel_worker(dsn, query, batching, verify, worker_id):
+def run_parallel_worker(dsn, query, batching, verify, worker_id, jetstream_async=False):
     """Runs in its own thread with its own connection (opened here, not
     shared) - the real parallelism is N separate Postgres backend
     processes doing the encode+publish work concurrently; the Python
@@ -1117,6 +1154,10 @@ def run_parallel_worker(dsn, query, batching, verify, worker_id):
                     rows = rows or 0
                     batches = rows
                 total_bytes = int(total_bytes) if total_bytes is not None else 0
+            if jetstream_async:
+                # Not durable until flushed - see run_one_format()'s same
+                # comment. Included in "elapsed" for the same reason.
+                cur.execute("SELECT nats_publish_stream_flush()")
         return {"worker_id": worker_id, "rows": rows, "batches": batches, "total_bytes": total_bytes,
                 "elapsed": time.perf_counter() - t0, "reference": reference}
     finally:
@@ -1196,7 +1237,8 @@ def run_one_format_parallel(conn, args, fmt, subject_columns, all_columns):
         t0 = time.perf_counter()
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             futures = [
-                ex.submit(run_parallel_worker, args.dsn, q, batching, args.verify, i)
+                ex.submit(run_parallel_worker, args.dsn, q, batching, args.verify, i,
+                          jetstream_async=args.jetstream_async)
                 for i, q in enumerate(worker_queries)
             ]
             worker_results = [f.result() for f in futures]
@@ -1326,7 +1368,7 @@ def run_one_format(conn, args, fmt, subject_columns, all_columns):
     subject_expr = build_subject_expr(
         subject_columns, args.subject_prefix, fmt, args.subject_format_suffix, args.on_bad_subject_value
     )
-    publish_fn = "nats_publish_binary_stream" if args.jetstream else "nats_publish_binary"
+    publish_fn = _select_publish_fn(args)
     if batching and args.batch_encoding == "native":
         publish_query = build_native_columnar_publish_query(
             args.sql_stripped, args.limit, fmt, subject_columns,
@@ -1429,6 +1471,20 @@ def run_one_format(conn, args, fmt, subject_columns, all_columns):
             except psycopg.Error as e:
                 metrics["error"] = f"publish failed: {e}"
                 return metrics
+
+        if args.jetstream_async:
+            # A nats_publish_binary_stream_async() publish isn't durable
+            # until flushed - include the flush in publish_secs, since
+            # that's the point actual durability is bought, not when the
+            # publish calls themselves returned (see --jetstream-async's
+            # help).
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT nats_publish_stream_flush()")
+            except psycopg.Error as e:
+                metrics["error"] = f"flush failed after publishing {published} row(s): {e}"
+                return metrics
+
         publish_secs = time.perf_counter() - t0
         batch_note = f" as {batches} batch(es), {args.batch_encoding} encoding" if batching else ""
         print(f"  published {published} row(s){batch_note} in {fmt_secs(publish_secs)} "
@@ -1592,6 +1648,8 @@ def main():
                  "nats-server: \"subjects that overlap with jetstream api require no-ack to be "
                  "true\"), and --subject-columns alone always produces one (e.g. '*.msgpack'). "
                  "See --jetstream's help for the full explanation.")
+    if args.jetstream_async and not args.jetstream:
+        sys.exit("error: --jetstream-async requires --jetstream")
 
     conn = psycopg.connect(args.dsn, autocommit=True)
 
