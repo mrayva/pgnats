@@ -1,5 +1,29 @@
 # CHANGELOG
 
+## [1.1.2] - 2026-08-17
+
+### Added (New Features)
+
+* `nats_put_binary_async(bucket, key, data)`: pipelined KV put, mirroring
+  1.1.1's `nats_publish_binary_stream_async()` - queues the ack instead
+  of waiting for it, sharing the same `pending_stream_acks` queue,
+  `PENDING_STREAM_ACK_LIMIT` auto-drain, and `nats_publish_stream_flush()`
+  as the stream-publish async path (no separate flush function needed;
+  `kv::Store::put()` turned out to be nothing more than
+  `context.publish(subject, value).await?.await?` under the hood - the
+  same mechanism, just with the subject built from the bucket's
+  key-value prefix). Not durable until `nats_publish_stream_flush()` is
+  called. Doesn't validate the key or support JetStream domains the way
+  `nats_put_binary()` does - pre-sanitize keys.
+
+  Measured: 500,000 real rows, single connection, fully acked -
+  194,932 rows/s, vs ~2,467 rows/s per connection for the existing
+  synchronous `nats_put_binary()` (~2,467/s single-connection derived
+  from a 16-connection/41,505 rows/s aggregate measurement) - roughly
+  **79x** on one connection, and past native `nats bench kv put`'s own
+  16-client aggregate ceiling (41,382 msgs/s), which has no async/
+  pipelined put mode to compare against directly.
+
 ## [1.1.1] - 2026-08-17
 
 ### Fixed

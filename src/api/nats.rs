@@ -262,6 +262,43 @@ impl_nats_put! {
     binary, Vec<u8>
 }
 
+/// Like [`nats_put_binary`], but pipelined the same way
+/// [`nats_publish_binary_stream_async`] is: returns as soon as the put is
+/// handed to the connection instead of waiting for its ack. Shares that
+/// same function's queue and durability caveat - **not durable until
+/// [`nats_publish_stream_flush`] is called** - and the same auto-drain
+/// safety net (`PENDING_STREAM_ACK_LIMIT`).
+///
+/// Two things the synchronous `nats_put_binary` does that this does not:
+/// it doesn't validate the key before publishing (an empty key, or one
+/// with a leading/trailing `.`, builds a different subject than intended
+/// instead of failing fast - pre-sanitize keys the same way this session
+/// already does for stream subjects), and it doesn't support JetStream
+/// domains. Both are fine for the common case, including this
+/// deployment's.
+///
+/// # Arguments
+/// * `bucket` - Name of the KV bucket
+/// * `key` - Key to store the value under
+/// * `data` - Binary data to store as `Vec<u8>`
+///
+/// # SQL Usage
+/// ```sql
+/// SELECT nats_put_binary_async('config_files', 'server_cert', payload) FROM big_table;
+/// SELECT nats_publish_stream_flush();  -- required for durability
+/// ```
+#[cfg(feature = "kv")]
+#[pg_extern]
+pub fn nats_put_binary_async(bucket: String, key: &str, data: Vec<u8>) -> anyhow::Result<()> {
+    CTX.with_borrow_mut(|ctx| {
+        ctx.rt.block_on(async {
+            let res = ctx.nats_connection.put_value_async(bucket, key, data).await;
+            tokio::task::yield_now().await;
+            res
+        })
+    })
+}
+
 #[cfg(feature = "kv")]
 impl_nats_put! {
     /// Stores a UTF-8 text value in the KV bucket under the specified key.

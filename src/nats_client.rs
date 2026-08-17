@@ -224,6 +224,61 @@ impl NatsClient {
             js.publish(subject, message.into()).await?
         };
 
+        self.queue_ack(ack).await
+    }
+
+    /// Like [`Self::put_value`], but pipelined the same way
+    /// [`Self::publish_stream_async`] is - queues the ack instead of
+    /// waiting for it, shares the same `pending_stream_acks` queue and
+    /// [`Self::flush_stream_acks`].
+    ///
+    /// `kv::Store::put()` is, itself, nothing more than
+    /// `self.stream.context.publish(subject, value).await?.await?` -  the
+    /// exact same `Context::publish()` this uses for
+    /// `publish_stream_async()`, just with the subject built from the
+    /// bucket's key-value prefix instead of a caller-given subject. `Store`
+    /// doesn't expose a way to get the first await's `PublishAckFuture`
+    /// without also driving the second, so this rebuilds that subject
+    /// itself from `Store`'s own public `prefix`/`put_prefix` fields (the
+    /// same two `put()` reads) and publishes through this client's own
+    /// already-held `Context` rather than `Store`'s private one - both are
+    /// contexts on the same underlying connection, so this is equivalent,
+    /// not a workaround.
+    ///
+    /// Two things `Store::put()` does that this does *not*: it doesn't
+    /// validate the key (`kv::is_valid_key()` isn't reachable from outside
+    /// the crate - only its regex-backed rules are lost, not enforcement:
+    /// a key that's empty or has a leading/trailing `.` would build a
+    /// syntactically different subject than intended instead of failing
+    /// fast, so callers must pre-sanitize keys the same way this session's
+    /// subject-building already does for stream subjects), and it doesn't
+    /// support `use_jetstream_prefix` (JetStream domains) - both fine for
+    /// the common case (this deployment included) but worth knowing if
+    /// either ever changes.
+    pub async fn put_value_async(
+        &mut self,
+        bucket: impl ToString,
+        key: impl AsRef<str>,
+        data: impl ToBytes,
+    ) -> anyhow::Result<()> {
+        let data: Vec<u8> = data.to_bytes()?;
+        let subject = {
+            let store = self.get_or_create_bucket(bucket).await?;
+            let mut subject = String::with_capacity(store.prefix.len() + key.as_ref().len());
+            subject.push_str(store.put_prefix.as_ref().unwrap_or(&store.prefix));
+            subject.push_str(key.as_ref());
+            subject
+        };
+        let js = self.get_jetstream().await?;
+        let ack = js.publish(subject, data.into()).await?;
+
+        self.queue_ack(ack).await
+    }
+
+    async fn queue_ack(
+        &mut self,
+        ack: async_nats::jetstream::context::PublishAckFuture,
+    ) -> anyhow::Result<()> {
         self.pending_stream_acks.push(ack);
 
         if self.pending_stream_acks.len() >= PENDING_STREAM_ACK_LIMIT {
@@ -234,11 +289,11 @@ impl NatsClient {
         Ok(())
     }
 
-    /// Awaits every ack queued by [`Self::publish_stream_async`] on this
-    /// connection since the last flush (whether that was an explicit call
-    /// here or the automatic drain inside [`Self::publish_stream_async`]
-    /// once `PENDING_STREAM_ACK_LIMIT` was reached), concurrently. Returns
-    /// the number flushed by *this* call - not a running total, and not
+    /// Awaits every ack queued by [`Self::publish_stream_async`]/
+    /// [`Self::put_value_async`] on this connection since the last flush
+    /// (whether that was an explicit call here or an automatic drain once
+    /// `PENDING_STREAM_ACK_LIMIT` was reached), concurrently. Returns the
+    /// number flushed by *this* call - not a running total, and not
     /// necessarily every publish since the backend connected, since an
     /// automatic drain may already have flushed and cleared earlier ones.
     pub async fn flush_stream_acks(&mut self) -> anyhow::Result<u64> {
