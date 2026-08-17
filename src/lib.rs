@@ -23,6 +23,25 @@
 
 ::pgrx::pg_module_magic!();
 
+// Scoped to this crate's own Rust-side heap traffic only (String/Vec/etc.
+// allocated by pgnats's own code, via Rust's #[global_allocator] hook) -
+// does not touch Postgres's own palloc/memory-context allocator, which is
+// a separate system entirely. A profiled run of the async publish path
+// (perf record -g, 12M rows) showed ~11% of total CPU time in glibc's
+// allocator internals (_int_malloc/_int_free_chunk/realloc/
+// malloc_consolidate/...) - consistent with many small, short-lived
+// per-row allocations (subject Strings, payload Vecs, ack-tracking
+// structures) that a general-purpose allocator like ptmalloc pays real
+// per-call overhead for. mimalloc is designed for exactly this pattern
+// (thread-local free lists, low per-call overhead) - the same tradeoff
+// nats_asio already made for its own build (NATS_ASIO_USE_MIMALLOC).
+// Initializes once per backend process, before that backend's own
+// worker threads (pgnats's thread_local Tokio runtime) are spun up, so
+// this doesn't interact with Postgres's fork() model any differently
+// than any other per-backend global state already does.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod pg_tests;
 
 mod init;

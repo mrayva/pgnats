@@ -1,0 +1,4 @@
+-- No SQL-visible changes: 1.1.3 only swaps pgnats's own Rust-side global
+-- allocator to mimalloc (see Cargo.toml / src/lib.rs), for the per-row
+-- allocation churn the async publish/put paths pay. Same function
+-- signatures as 1.1.2.

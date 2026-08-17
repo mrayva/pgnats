@@ -1,6 +1,6 @@
 [package]
 name = "pgnats"
-version = "1.1.2"
+version = "1.1.3"
 edition = "2021"
 rust-version = "1.82.0"
 
@@ -30,6 +30,7 @@ sub = ["postcard", "reqwest"]
 anyhow = { version = "1.0", default-features = false }
 async-nats = { version = "0.45.0" }
 futures = "0.3.31"
+mimalloc = "0.1"
 pastey = "0.2.1"
 pgrx = { git = "https://github.com/pgcentralfoundation/pgrx.git", rev = "58147f1a5d6168ef36be58200e6e4527cb6cc772", version = "0.19.1", features = [
     "unsafe-postgres",

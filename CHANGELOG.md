@@ -1,5 +1,24 @@
 # CHANGELOG
 
+## [1.1.3] - 2026-08-17
+
+### Changed
+
+* pgnats's own Rust-side heap allocations (subject `String`s, payload
+  `Vec<u8>`s, ack-tracking structures - not Postgres's `palloc`, which is
+  untouched) now go through `mimalloc` instead of the system allocator.
+  A `perf record -g` profile of the 1.1.1 async publish path (12M rows)
+  showed ~11% of total CPU time in glibc allocator internals
+  (`_int_malloc`/`_int_free_chunk`/`realloc`/`malloc_consolidate`/...) -
+  consistent with the many small, short-lived per-row allocations the
+  async publish/put paths make. Same tradeoff nats_asio already makes for
+  its own build (`NATS_ASIO_USE_MIMALLOC`).
+
+  Measured, single connection, real rows, both fully acked: stream async
+  publish 207,900 -> 216,163 rows/s (+4%), KV async put 194,932 ->
+  217,014 rows/s (**+11%**) - roughly tracking the allocator's measured
+  share of the profile.
+
 ## [1.1.2] - 2026-08-17
 
 ### Added (New Features)
