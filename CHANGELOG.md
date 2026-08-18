@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## [1.1.4] - 2026-08-17
+
+### Changed
+
+* Raised the async publish/put paths' stop-and-wait batch size
+  (`PENDING_STREAM_ACK_LIMIT`) from 1,000 to 3,000. `join_all()`-ing a
+  batch of pending acks has a fixed cost that's amortized over more
+  messages with a bigger batch. Measured, 2M real rows, single
+  connection: 1,000 -> 210,637 rows/s, 2,000 -> 224,921, 3,000 ->
+  230,443-235,183, 4,800 -> 233,754 (flat past 3,000, not worth trading
+  away headroom under async-nats's 5,000 in-flight-ack semaphore for
+  no further gain). Same measured gain on both the stream and KV async
+  paths, since they share this batching mechanism.
+
+  Also tried and rejected (not shipped, not in this diff): a true
+  sliding window - await only the single oldest ack once the window
+  fills, instead of the whole batch - on the theory that it would avoid
+  blocking on a batch's own tail latency. Measured *worse* (~179,500
+  rows/s, reproduced twice): the per-await overhead this stack pays
+  on nearly every message in that design outweighs the bubble it
+  was meant to remove. Batch size is the lever that works here, not
+  batch *granularity*.
+
 ## [1.1.3] - 2026-08-17
 
 ### Changed

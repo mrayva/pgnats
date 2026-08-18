@@ -17,14 +17,25 @@ use crate::{
     utils::{extract_headers, resolve_config_path, FromBytes, ToBytes},
 };
 
-// Kept comfortably under async-nats's own default max-in-flight-acks
-// semaphore capacity (5,000, jetstream::context::ContextBuilder's
+// Kept under async-nats's own default max-in-flight-acks semaphore
+// capacity (5,000, jetstream::context::ContextBuilder's
 // semaphore_capacity default) - draining here is what returns permits to
 // that semaphore, so this bound has to be reached well before the
 // semaphore itself would be exhausted, or publish_stream_async() would
 // block waiting on a permit nothing is freeing. See
 // NatsClient::publish_stream_async()'s doc for what happens if it isn't.
-const PENDING_STREAM_ACK_LIMIT: usize = 1_000;
+//
+// 3,000, not 1,000: this is a stop-and-wait batch size (fire this many,
+// join_all() the whole batch, repeat), and bigger batches amortize that
+// join_all()'s own fixed cost over more messages - measured directly, 2M
+// real rows single connection: 1,000 -> 210,637 rows/s, 2,000 -> 224,921,
+// 3,000 -> 230,443-235,183, 4,800 -> 233,754 (flat past 3,000, not worth
+// the reduced headroom under the 5,000 semaphore cap). A true sliding
+// window (await only the single oldest ack once full, instead of the
+// whole batch) was also tried and measured *worse* (~179,500 rows/s) -
+// the per-await overhead this stack pays on nearly every message in that
+// design outweighs the stop-and-wait bubble it was meant to remove.
+const PENDING_STREAM_ACK_LIMIT: usize = 3_000;
 
 /// Awaits a batch of pipelined JetStream acks concurrently, reporting every
 /// failure (not just the first) so a caller sees the full extent of a bad

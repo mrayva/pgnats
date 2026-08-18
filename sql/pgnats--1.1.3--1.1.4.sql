@@ -1,0 +1,5 @@
+-- No SQL-visible changes: 1.1.4 raises the async publish/put paths'
+-- stop-and-wait batch size from 1,000 to 3,000 (PENDING_STREAM_ACK_LIMIT
+-- in src/nats_client.rs) - measured to be the sweet spot between batch
+-- overhead and headroom under async-nats's 5,000 in-flight-ack
+-- semaphore. Same function signatures as 1.1.3.
