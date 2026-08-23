@@ -18,7 +18,11 @@ impl_nats_publish! {
     /// * `headers` *(optional)* – Key-value headers to include in the message, as `jsonb`
     ///
     /// # Returns
-    /// * `Ok(())` - On successful publish
+    /// * `Ok(())` - On successful *handoff* to this connection, not proof it
+    ///   reached nats-server. Under a high call rate (e.g. once per row from
+    ///   a tight loop), the underlying client can enqueue faster than it
+    ///   writes to the socket - call [`nats_publish_flush`] to wait for
+    ///   actual delivery before treating a batch as durable.
     ///
     /// # SQL Usage
     /// ```sql
@@ -41,7 +45,9 @@ impl_nats_publish! {
     /// * `headers` *(optional)* – Key-value headers to include in the message, as `jsonb`
     ///
     /// # Returns
-    /// * `Ok(())` - On successful publish
+    /// * `Ok(())` - On successful *handoff* to this connection, not proof it
+    ///   reached nats-server. Under a high call rate, call
+    ///   [`nats_publish_flush`] to wait for actual delivery.
     ///
     /// # SQL Usage
     /// ```sql
@@ -64,7 +70,9 @@ impl_nats_publish! {
     /// * `headers` *(optional)* – Key-value headers to include in the message, as `jsonb`
     ///
     /// # Returns
-    /// * `Ok(())` - On successful publish
+    /// * `Ok(())` - On successful *handoff* to this connection, not proof it
+    ///   reached nats-server. Under a high call rate, call
+    ///   [`nats_publish_flush`] to wait for actual delivery.
     ///
     /// # SQL Usage
     /// ```sql
@@ -87,7 +95,9 @@ impl_nats_publish! {
     /// * `headers` *(optional)* – Key-value headers to include in the message, as `jsonb`
     ///
     /// # Returns
-    /// * `Ok(())` - On successful publish
+    /// * `Ok(())` - On successful *handoff* to this connection, not proof it
+    ///   reached nats-server. Under a high call rate, call
+    ///   [`nats_publish_flush`] to wait for actual delivery.
     ///
     /// # SQL Usage
     /// ```sql
@@ -98,6 +108,57 @@ impl_nats_publish! {
     /// The stream version [`nats_publish_jsonb_stream`] provides JetStream
     /// persistence and delivery guarantees.
     jsonb, pgrx::JsonB
+}
+
+/// Blocks until every plain (non-JetStream) publish made on this backend
+/// connection *up to the moment this call actually runs* has been written
+/// to the socket.
+///
+/// [`nats_publish_binary`]/[`nats_publish_text`]/[`nats_publish_json`]/
+/// [`nats_publish_jsonb`] return `Ok(())` as soon as the message is handed
+/// to this connection's internal command channel - not once it's actually
+/// sent. Under a high enough call rate (e.g. once per row from a tight
+/// Postgres loop), the connection's own write/flush loop can fall behind,
+/// and a "successfully" published message can sit unsent in an internal
+/// buffer with nothing surfacing that fact - core NATS publish has no ack,
+/// so unlike the JetStream path ([`nats_publish_stream_flush`]) there is no
+/// way to detect this after the fact short of forcing a flush.
+///
+/// **Real, measured limitation - this is not a complete fix for silent loss
+/// under heavy burst load, read before relying on it for durability.**
+/// Calling this once after a large fast batch does not reliably prevent
+/// loss under extreme burst + system load: reproduced directly against a
+/// real `nats_sidecar` benchmark stall condition (a heavy 32-instance
+/// teardown immediately followed by a high-burst single-consumer publish),
+/// a single trailing flush still stalled short in 2 of 5 trials - no better
+/// than 1 of 5 with no flush at all. Only flushing after *every single
+/// publish* reliably prevented the stall in reproduction (0 of 3 trials),
+/// at a real, severe cost: ~50-80x slower than unflushed publishing
+/// (measured: 200k rows in 0.25-0.4s unflushed vs 20s with a flush after
+/// every row). A coarser middle ground (flushing every 500 rows, which
+/// costs next to nothing extra - 0.43s for 200k rows) still stalled in 1 of
+/// 3 trials, so it is not a safe default granularity either. In short: the
+/// loss this function detects/waits-out is real, but it can accumulate
+/// *during* a large in-flight burst, not just linger unflushed after the
+/// batch ends - so a single call at the end of a big batch is a genuine
+/// improvement over never flushing, but not a proven guarantee against loss
+/// under this specific extreme shape of load. For that, flush far more
+/// often (per-row, at real throughput cost) or investigate further; for
+/// ordinary, non-pathological publish rates this is a reasonable place to
+/// get a real "did this actually go out" checkpoint (e.g. before a commit).
+///
+/// This does not confirm nats-server received or routed the message, only
+/// that this client actually wrote it to its own socket - core NATS publish
+/// has no server-side ack to wait for beyond that.
+///
+/// # SQL Usage
+/// ```sql
+/// SELECT nats_publish_binary('events.raw', payload) FROM big_table;
+/// SELECT nats_publish_flush();  -- confirms this client actually sent everything above
+/// ```
+#[pg_extern]
+pub fn nats_publish_flush() -> anyhow::Result<()> {
+    CTX.with_borrow_mut(|ctx| ctx.rt.block_on(async { ctx.nats_connection.flush().await }))
 }
 
 /// Publishes a raw binary message to a JetStream stream *without* waiting

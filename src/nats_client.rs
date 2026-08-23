@@ -312,6 +312,56 @@ impl NatsClient {
         drain_stream_acks(pending).await
     }
 
+    /// Blocks until every plain (non-JetStream) publish handed to this
+    /// connection so far has been written to the socket *at the point this
+    /// call actually runs*.
+    ///
+    /// `Client::publish()` only awaits handing the message to async-nats's
+    /// internal command channel - it returns `Ok(())` the moment the
+    /// connection actor task accepts the message, not once it's actually on
+    /// the wire. `Client::flush()` resolves only after async-nats's
+    /// connection actor observes `poll_flush()` return `Ready(Ok(()))`
+    /// (confirmed by reading async-nats 0.45's own `lib.rs` run loop - flush
+    /// observers are drained only in that branch), so this is a genuine
+    /// wait-for-actual-socket-write, not just another buffered command.
+    ///
+    /// **Real, measured caveat - read before relying on this for
+    /// durability**: calling this once after a large, fast batch (e.g. one
+    /// call per row from a tight Postgres loop publishing 200k rows) does
+    /// *not* reliably prevent loss under heavy burst + system load,
+    /// confirmed by direct reproduction against the exact stall condition
+    /// this function was written to fix (a real `nats_sidecar` benchmark: a
+    /// heavy 32-process teardown immediately followed by a high-burst
+    /// single-consumer run) - 2 of 5 trials with a single trailing flush
+    /// still stalled short, no better than the 1 of 5 baseline with no
+    /// flush at all. Only flushing after *every single publish* eliminated
+    /// the stall in reproduction (0 of 3 trials), at a real, severe cost -
+    /// ~50-80x slower than unflushed publishing, measured directly (200k
+    /// rows: 0.25-0.4s unflushed vs 20s with a flush after every row).
+    /// Flushing every 500 rows, which costs essentially nothing extra
+    /// (0.43s for 200k rows, same ballpark as unflushed), still stalled in
+    /// 1 of 3 trials - not a safe middle ground either, at least not at
+    /// that granularity. **This means the loss isn't only "data sitting
+    /// unflushed when the SQL function returns" - it happens somewhere
+    /// during a large in-flight burst itself**, and this function on its
+    /// own, called only after a batch, is not a complete fix for that
+    /// specific pathological condition. It is still a real, correct
+    /// primitive - "did this client actually write what it published so
+    /// far" - useful on its own terms (e.g. before a commit, under
+    /// ordinary/non-pathological load), just not a proven cure for silent
+    /// loss under this specific extreme stress shape without flushing far
+    /// more often than is affordable by default.
+    ///
+    /// This does not confirm nats-server received or routed the message
+    /// (core NATS publish has no ack, unlike JetStream's
+    /// [`Self::flush_stream_acks`]) - only that this client actually wrote
+    /// it to its own socket.
+    pub async fn flush(&mut self) -> anyhow::Result<()> {
+        let conn = self.get_connection().await?;
+        conn.flush().await?;
+        Ok(())
+    }
+
     pub async fn invalidate_connection(&mut self) {
         let connection = { self.connection.take() };
 

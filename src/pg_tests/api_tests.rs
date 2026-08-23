@@ -32,6 +32,29 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_pgnats_publish_flush() {
+        let subject = "test.test_nats_publish_flush";
+
+        let res = api::nats_publish_binary(subject, b"one".to_vec(), None, None);
+        assert!(res.is_ok(), "nats_publish_binary occurs error: {:?}", res);
+        let res = api::nats_publish_binary(subject, b"two".to_vec(), None, None);
+        assert!(res.is_ok(), "nats_publish_binary occurs error: {:?}", res);
+
+        let res = api::nats_publish_flush();
+        assert!(res.is_ok(), "nats_publish_flush occurs error: {:?}", res);
+
+        // A flush with nothing pending must also succeed, not error - the
+        // common case for a caller that flushes defensively before every
+        // commit regardless of whether this backend published anything.
+        let res = api::nats_publish_flush();
+        assert!(
+            res.is_ok(),
+            "nats_publish_flush on an idle connection occurs error: {:?}",
+            res
+        );
+    }
+
+    #[pg_test]
     fn test_pgnats_publish_stream() {
         let subject = "test.test_nats_publish_stream";
         let message = "Hello, World! 🦀".to_string();

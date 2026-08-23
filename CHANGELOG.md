@@ -1,5 +1,43 @@
 # CHANGELOG
 
+## [1.1.5] - 2026-08-23
+
+### Added
+
+* `nats_publish_flush()` - blocks until every plain (non-JetStream) publish
+  made on this backend connection *up to that point* has been written to
+  the socket. Root-caused via a real `nats_sidecar` benchmark stall:
+  `async-nats`'s `Client::publish()` only awaits handing the message to its
+  internal command channel, not writing it to the wire - under a high call
+  rate (one `nats_publish_binary`/etc. call per row from a tight Postgres
+  loop) the connection's write/flush loop can fall behind, and a
+  "successfully" published message (`Ok(())`) can sit unsent in an internal
+  buffer with nothing before this release able to detect it. Same class of
+  gap the JetStream path already had a fix for (`nats_publish_stream_flush`)
+  - core NATS still has no publish ack, so this confirms the client actually
+  wrote the message, not that the server received it.
+  `nats_publish_binary`/`nats_publish_text`/`nats_publish_json`/
+  `nats_publish_jsonb` are unchanged by default - this is opt-in.
+
+  **Measured, not just asserted: this does not fully close the original
+  stall on its own.** Reproduced directly against the real stress condition
+  that surfaced it (a heavy 32-`nats_sidecar`-instance teardown immediately
+  followed by a high-burst single-consumer publish): a single flush call
+  after a 200k-row batch still stalled short in 2 of 5 trials, no better
+  than 1 of 5 with no flush at all - the loss can accumulate *during* a
+  large in-flight burst, not just linger unflushed after the batch ends.
+  Only flushing after *every single publish* reliably prevented the stall
+  in reproduction (0 of 3 trials), at a real, severe cost: ~50-80x slower
+  (200k rows, 0.25-0.4s unflushed vs 20s flushed every row). A coarser
+  middle ground (flush every 500 rows, ~free at 0.43s for 200k rows) still
+  stalled in 1 of 3 trials - not a safe default granularity either. Shipped
+  anyway because it's a real, correctly-implemented primitive useful on its
+  own terms for ordinary (non-pathological-burst) durability checkpoints
+  (e.g. before a commit) - see its own doc comment
+  (`src/api/nats.rs::nats_publish_flush`) for the full measured picture
+  before relying on it as a complete fix for this specific extreme load
+  shape.
+
 ## [1.1.4] - 2026-08-17
 
 ### Changed
