@@ -258,7 +258,7 @@ from concurrent.futures import ThreadPoolExecutor
 import psycopg
 from psycopg import sql
 
-FORMATS = ("msgpack", "cbor", "zera", "flexbuffers", "ion", "bson", "beve")
+FORMATS = ("msgpack", "cbor", "zera", "flexbuffers", "ion", "bson", "beve", "arrow")
 
 # A NATS subject token can't contain whitespace or the wildcard characters
 # '*'/'>' (they'd change what the token means to a subscriber), and '.'
@@ -348,6 +348,35 @@ def parse_args():
                          "--batch-size (each worker batches its own share) and --verify (one "
                          "shared consumer per format; each worker's decoded reference rows are "
                          "merged before comparing).")
+    p.add_argument("--target-rate", type=float, default=None,
+                    help="Cap the AGGREGATE publish rate at N rows/sec instead of publishing as "
+                         "fast as --workers can go (opt-in, default: off = today's unthrottled "
+                         "behavior, unchanged). Decouples the offered input rate to a downstream "
+                         "consumer from whatever throughput a given --workers count happens to "
+                         "achieve on a given run - the latter drifts run to run (page cache state, "
+                         "CPU contention) enough that comparing two runs' loss/zero-loss behavior "
+                         "at 'the same --workers' is not actually comparing them at the same input "
+                         "rate. Implemented by splitting each worker's own row range into "
+                         "--rate-chunks-per-worker further sub-ranges and sleeping between them to "
+                         "hold the achieved rate to the target - NOT by streaming rows back to "
+                         "Python per-row (that path is deliberately avoided elsewhere in this tool, "
+                         "see run_parallel_worker()'s own comment on why it's GIL-bound and slow); "
+                         "each chunk still uses the same one-round-trip aggregate-count query the "
+                         "unthrottled path does, just scoped to a smaller row range. Forces the "
+                         "--workers > 1 parallel/materialized code path even when --workers is left "
+                         "at its default of 1, since that path owns the chunking machinery this "
+                         "needs. Not combinable with --verify (v1 scope - the fleet-benchmark use "
+                         "case this exists for never uses --verify; streaming+pacing together adds "
+                         "real complexity for no known need yet).")
+    p.add_argument("--rate-chunks-per-worker", type=int, default=20,
+                    help="Only meaningful with --target-rate. How many smaller physical-page "
+                         "sub-ranges each worker's own share is split into for pacing (default: "
+                         "20). Higher = smoother/more accurate rate control (checks and corrects "
+                         "more often) at the cost of more round trips; lower = coarser control "
+                         "with less overhead. 20 chunks over a multi-second run checks roughly "
+                         "every few hundred milliseconds to a few seconds depending on table size "
+                         "and worker count - tune down for a short --limit-ed run, up for very "
+                         "smooth long-run pacing.")
     p.add_argument("--jetstream", action="store_true",
                     help="Publish via JetStream (nats_publish_binary_stream) instead of core "
                          "NATS pub/sub (nats_publish_binary), and (with --verify) consume via "
@@ -931,19 +960,27 @@ def build_native_columnar_publish_query(user_sql, limit, fmt, subject_columns, s
         "SELECT *, ((_e2e_seq - 1) / {}) AS _e2e_batch_id FROM ({}) AS numbered"
     ).format(sql.Literal(batch_size), numbered)
 
+    # pg_arrow's rows_to_arrow(anyarray) is a single, format-name-less function (unlike
+    # pg_zerialize's per-format rows_to_<fmt>_columnar) - Arrow has no per-format variants, it's
+    # a completely separate extension that just happens to fit this same "aggregate whole rows,
+    # get bytea back" shape. arrow_to_jsonb (also pg_arrow's own) fits the {fmt}_to_jsonb verify
+    # convention exactly, so --verify works unchanged for fmt="arrow" too.
+    rows_to_fmt_columnar_name = "rows_to_arrow" if fmt == "arrow" else f"rows_to_{fmt}_columnar"
+    to_jsonb_name = "arrow_to_jsonb" if fmt == "arrow" else f"{fmt}_to_jsonb"
+
     grouped = sql.SQL(
         "SELECT {subj}, count(*) AS _e2e_batch_rows, "
         "{rows_to_fmt_columnar}(array_agg(_e2e_row ORDER BY _e2e_seq)) AS _e2e_payload "
         "FROM ({batched}) AS b GROUP BY {subj}, _e2e_batch_id"
     ).format(
         subj=subject_col_list,
-        rows_to_fmt_columnar=sql.Identifier(f"rows_to_{fmt}_columnar"),
+        rows_to_fmt_columnar=sql.Identifier(rows_to_fmt_columnar_name),
         batched=batched,
     )
 
     cols = []
     if verify:
-        cols.append(sql.SQL("{}(g._e2e_payload) AS _e2e_ref").format(sql.Identifier(f"{fmt}_to_jsonb")))
+        cols.append(sql.SQL("{}(g._e2e_payload) AS _e2e_ref").format(sql.Identifier(to_jsonb_name)))
     cols.append(sql.SQL("octet_length(g._e2e_payload) AS _e2e_bytes"))
     cols.append(sql.SQL("g._e2e_batch_rows"))
     cols.append(sql.SQL("{}({}, g._e2e_payload) AS _e2e_pub").format(sql.Identifier(publish_fn), subject_expr))
@@ -1011,6 +1048,34 @@ def materialize_partitioned(conn, user_sql, limit, table_name):
         cur.execute(query)
         cur.execute(sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier(table_name)))
         return cur.fetchone()[0]
+
+
+def get_relation_pages(conn, table_name):
+    """Standalone page-count lookup (same query ctid_page_bounds() itself uses internally) -
+    kept as its own function rather than having ctid_page_bounds() return it too, so
+    --target-rate's own chunking (see split_page_range()/run_rate_limited_worker()) doesn't
+    need to change that function's existing, already-relied-upon return shape."""
+    with conn.cursor() as cur:
+        cur.execute(
+            sql.SQL("SELECT pg_relation_size({t}) / current_setting('block_size')::bigint").format(
+                t=sql.Literal(table_name)
+            )
+        )
+        pages = cur.fetchone()[0] or 0
+    return max(pages, 1)
+
+
+def split_page_range(lo, hi, n):
+    """Splits the CONCRETE page range [lo, hi) into n roughly-equal, non-overlapping, gap-free
+    sub-ranges - the same arithmetic ctid_page_bounds() uses to split the whole table across
+    workers, generalized so --target-rate's own pacing chunks (one worker's own range split
+    further, for sleeping between chunks - see run_rate_limited_worker()) can reuse it instead
+    of duplicating the rounding logic. Every returned bound is concrete (no open-ended/None
+    upper bound, unlike ctid_page_bounds()'s own last-worker convention) - the caller decides
+    whether to open-end its own last piece.
+    """
+    width = hi - lo
+    return [(lo + (i * width) // n, lo + ((i + 1) * width) // n) for i in range(n)]
 
 
 def ctid_page_bounds(conn, table_name, workers):
@@ -1164,6 +1229,51 @@ def run_parallel_worker(dsn, query, batching, verify, worker_id, jetstream_async
         conn.close()
 
 
+def run_rate_limited_worker(dsn, chunk_queries, batching, worker_id, target_rows_per_sec):
+    """--target-rate variant of run_parallel_worker(): walks `chunk_queries` (one worker's own
+    row range, pre-split into smaller physical-page sub-ranges by run_one_format_parallel() -
+    see split_page_range()) in order, sleeping between chunks to hold this worker's own SHARE
+    of the aggregate target rate. Each chunk still goes through the exact same one-round-trip
+    count-aggregate query the unthrottled path uses (build_count_query()/
+    build_batched_count_query()) - NOT per-row streaming - for the same GIL-bound reason
+    run_parallel_worker()'s own docstring explains; this only adds a sleep between an otherwise
+    unmodified sequence of those same aggregate calls, now scoped to sub-ranges instead of one
+    whole-worker range. --verify is not supported here (see --target-rate's own --help text).
+    """
+    conn = psycopg.connect(dsn, autocommit=True)
+    try:
+        wall_t0 = time.perf_counter()
+        total_rows = 0
+        total_batches = 0
+        total_bytes = 0
+        with conn.cursor() as cur:
+            for chunk_query in chunk_queries:
+                chunk_t0 = time.perf_counter()
+                count_query = build_batched_count_query(chunk_query) if batching else build_count_query(chunk_query)
+                cur.execute(count_query)
+                if batching:
+                    batches, rows, nbytes, _min_b, _max_b = cur.fetchone()
+                    rows = int(rows) if rows is not None else 0
+                else:
+                    rows, nbytes, _avg_b, _min_b, _max_b = cur.fetchone()
+                    rows = rows or 0
+                    batches = rows
+                nbytes = int(nbytes) if nbytes is not None else 0
+                total_rows += rows
+                total_batches += batches
+                total_bytes += nbytes
+
+                chunk_elapsed = time.perf_counter() - chunk_t0
+                if target_rows_per_sec and rows:
+                    target_elapsed = rows / target_rows_per_sec
+                    if target_elapsed > chunk_elapsed:
+                        time.sleep(target_elapsed - chunk_elapsed)
+        return {"worker_id": worker_id, "rows": total_rows, "batches": total_batches,
+                "total_bytes": total_bytes, "elapsed": time.perf_counter() - wall_t0, "reference": None}
+    finally:
+        conn.close()
+
+
 def run_one_format_parallel(conn, args, fmt, subject_columns, all_columns):
     """--workers > 1 path: materializes --sql once (see
     materialize_partitioned()), then fans out N independent connections
@@ -1227,22 +1337,57 @@ def run_one_format_parallel(conn, args, fmt, subject_columns, all_columns):
                 print("  consumer subscribed")
 
         encoding_note = f", {args.batch_encoding} batch encoding" if batching else ""
-        print(f"== [{fmt}] {step}. Publishing ({args.workers} parallel connections{encoding_note}) ==")
+        rate_note = f", target rate {args.target_rate:.0f} rows/s" if args.target_rate else ""
+        print(f"== [{fmt}] {step}. Publishing ({args.workers} parallel connections{encoding_note}{rate_note}) ==")
         step += 1
-        worker_queries = [
-            build_worker_publish_query(conn, args, fmt, subject_columns, subject_expr, all_columns,
-                                        table_name, lo, hi, batching, args.verify)
-            for lo, hi in bounds
-        ]
-        t0 = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futures = [
-                ex.submit(run_parallel_worker, args.dsn, q, batching, args.verify, i,
-                          jetstream_async=args.jetstream_async)
-                for i, q in enumerate(worker_queries)
+
+        if args.target_rate:
+            # See --target-rate's own --help text and run_rate_limited_worker()'s docstring:
+            # each worker's own (lo, hi) range gets split FURTHER into --rate-chunks-per-worker
+            # smaller sub-ranges, one build_worker_publish_query() call each (identical query
+            # shape to the unthrottled path below, just scoped smaller) - only the LAST worker's
+            # LAST chunk stays open-ended (None), preserving ctid_page_bounds()'s own "catch
+            # anything past the final rounded boundary" guarantee for the table as a whole.
+            if args.verify:
+                metrics["error"] = "--target-rate cannot be combined with --verify (see --target-rate's own --help text)"
+                return metrics
+            total_pages = get_relation_pages(conn, table_name)
+            per_worker_target = args.target_rate / args.workers
+            worker_chunk_lists = []
+            for lo, hi in bounds:
+                concrete_hi = hi if hi is not None else total_pages
+                sub_bounds = split_page_range(lo, concrete_hi, args.rate_chunks_per_worker)
+                if hi is None and sub_bounds:
+                    last_lo, _ = sub_bounds[-1]
+                    sub_bounds[-1] = (last_lo, None)
+                worker_chunk_lists.append([
+                    build_worker_publish_query(conn, args, fmt, subject_columns, subject_expr, all_columns,
+                                                table_name, sub_lo, sub_hi, batching, False)
+                    for sub_lo, sub_hi in sub_bounds
+                ])
+            t0 = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=args.workers) as ex:
+                futures = [
+                    ex.submit(run_rate_limited_worker, args.dsn, chunk_queries, batching, i, per_worker_target)
+                    for i, chunk_queries in enumerate(worker_chunk_lists)
+                ]
+                worker_results = [f.result() for f in futures]
+            wall_secs = time.perf_counter() - t0
+        else:
+            worker_queries = [
+                build_worker_publish_query(conn, args, fmt, subject_columns, subject_expr, all_columns,
+                                            table_name, lo, hi, batching, args.verify)
+                for lo, hi in bounds
             ]
-            worker_results = [f.result() for f in futures]
-        wall_secs = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=args.workers) as ex:
+                futures = [
+                    ex.submit(run_parallel_worker, args.dsn, q, batching, args.verify, i,
+                              jetstream_async=args.jetstream_async)
+                    for i, q in enumerate(worker_queries)
+                ]
+                worker_results = [f.result() for f in futures]
+            wall_secs = time.perf_counter() - t0
 
         for w in sorted(worker_results, key=lambda w: w["worker_id"]):
             print(f"  worker {w['worker_id']}: {w['rows']} row(s) in {fmt_secs(w['elapsed'])} "
@@ -1360,7 +1505,11 @@ def run_one_format(conn, args, fmt, subject_columns, all_columns):
     `all_columns` is only used when --batch-size > 1 (introspected once in
     main(), not per format - the column list doesn't depend on fmt).
     """
-    if args.workers > 1:
+    if args.workers > 1 or args.target_rate:
+        # --target-rate forces the parallel path even at the default --workers=1: rate pacing
+        # is implemented entirely in terms of that path's own materialize+ctid-chunk machinery
+        # (see run_one_format_parallel()'s own --target-rate branch) - a single "worker" is a
+        # valid (if less parallel) way to run it, not a special case that path needs to handle.
         return run_one_format_parallel(conn, args, fmt, subject_columns, all_columns)
 
     metrics = {"format": fmt, "error": None}
@@ -1642,6 +1791,12 @@ def main():
         sys.exit("error: --batch-size must be >= 1")
     if args.workers < 1:
         sys.exit("error: --workers must be >= 1")
+    if args.target_rate is not None and args.target_rate <= 0:
+        sys.exit("error: --target-rate must be > 0")
+    if args.target_rate is not None and args.verify:
+        sys.exit("error: --target-rate cannot be combined with --verify (see --target-rate's own --help text)")
+    if args.rate_chunks_per_worker < 1:
+        sys.exit("error: --rate-chunks-per-worker must be >= 1")
     if args.jetstream and not args.subject_prefix:
         sys.exit("error: --jetstream requires --subject-prefix - a JetStream stream's subject "
                  "pattern can't start with a bare wildcard token (confirmed directly against "
