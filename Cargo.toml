@@ -28,7 +28,7 @@ sub = ["postcard", "reqwest"]
 
 [dependencies]
 anyhow = { version = "1.0", default-features = false }
-async-nats = { version = "0.45.0" }
+async-nats = { version = "0.50.0" }
 futures = "0.3.31"
 mimalloc = "0.1"
 pastey = "0.2.1"
