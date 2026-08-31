@@ -70,7 +70,24 @@ pub mod ctx;
 /// It must be visible at the root of your extension crate.
 #[cfg(test)]
 pub mod pg_test {
-    pub fn setup(_options: Vec<&str>) {}
+    // Without this, the test cluster's postmaster reliably fails to start:
+    // "cannot allocate memory in static TLS block" loading pgnats.so.
+    // Root cause: this crate's #[global_allocator] (mimalloc, see lib.rs)
+    // emits large initial-exec-model thread-locals for its per-thread heap
+    // state - glibc's dynamic loader only reserves a small "static TLS
+    // surplus" for libraries dlopen()'d after process startup (exactly how
+    // Postgres loads shared_preload_libraries/extensions), and mimalloc's
+    // block doesn't fit. Confirmed via a minimal manual repro (bare initdb
+    // + shared_preload_libraries='pgnats' + pg_ctl start, no pgrx/cargo
+    // involved at all) - fails identically, and setting this exact
+    // GLIBC_TUNABLES fixes it. This must be set here (before `run_test()`
+    // spawns pg_ctl as a child of this process, which inherits it) rather
+    // than as a one-off environment tweak, since it's a property of this
+    // crate's own choice of global allocator, not of any particular
+    // machine or CI runner.
+    pub fn setup(_options: Vec<&str>) {
+        std::env::set_var("GLIBC_TUNABLES", "glibc.rtld.optional_static_tls=4096");
+    }
 
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
