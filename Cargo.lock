@@ -652,7 +652,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1078,7 +1078,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -1660,7 +1660,7 @@ dependencies = [
  "futures",
  "mimalloc",
  "pastey",
- "pgrx",
+ "pgrx 0.19.2",
  "pgrx-tests",
  "postcard",
  "reqwest",
@@ -1682,9 +1682,29 @@ dependencies = [
  "bitvec",
  "enum-map",
  "libc",
- "pgrx-macros",
- "pgrx-pg-sys",
- "pgrx-sql-entity-graph",
+ "pgrx-macros 0.19.1",
+ "pgrx-pg-sys 0.19.1",
+ "pgrx-sql-entity-graph 0.19.1",
+ "seahash",
+ "serde",
+ "serde_cbor",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "pgrx"
+version = "0.19.2"
+source = "git+https://github.com/pgcentralfoundation/pgrx.git?rev=70383e884582d1bcc7cd681d10886b995a2830cb#70383e884582d1bcc7cd681d10886b995a2830cb"
+dependencies = [
+ "bitflags",
+ "bitvec",
+ "enum-map",
+ "libc",
+ "pgrx-macros 0.19.2",
+ "pgrx-pg-sys 0.19.2",
+ "pgrx-sql-entity-graph 0.19.2",
  "seahash",
  "serde",
  "serde_cbor",
@@ -1702,7 +1722,25 @@ dependencies = [
  "cc",
  "clang-sys",
  "eyre",
- "pgrx-pg-config",
+ "pgrx-pg-config 0.19.1",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "shlex 2.0.1",
+ "syn 2.0.119",
+ "walkdir",
+]
+
+[[package]]
+name = "pgrx-bindgen"
+version = "0.19.2"
+source = "git+https://github.com/pgcentralfoundation/pgrx.git?rev=70383e884582d1bcc7cd681d10886b995a2830cb#70383e884582d1bcc7cd681d10886b995a2830cb"
+dependencies = [
+ "bindgen",
+ "cc",
+ "clang-sys",
+ "eyre",
+ "pgrx-pg-config 0.19.2",
  "proc-macro2",
  "quote",
  "regex",
@@ -1716,7 +1754,18 @@ name = "pgrx-macros"
 version = "0.19.1"
 source = "git+https://github.com/pgcentralfoundation/pgrx.git?rev=58147f1a5d6168ef36be58200e6e4527cb6cc772#58147f1a5d6168ef36be58200e6e4527cb6cc772"
 dependencies = [
- "pgrx-sql-entity-graph",
+ "pgrx-sql-entity-graph 0.19.1",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "pgrx-macros"
+version = "0.19.2"
+source = "git+https://github.com/pgcentralfoundation/pgrx.git?rev=70383e884582d1bcc7cd681d10886b995a2830cb#70383e884582d1bcc7cd681d10886b995a2830cb"
+dependencies = [
+ "pgrx-sql-entity-graph 0.19.2",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -1742,15 +1791,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgrx-pg-config"
+version = "0.19.2"
+source = "git+https://github.com/pgcentralfoundation/pgrx.git?rev=70383e884582d1bcc7cd681d10886b995a2830cb#70383e884582d1bcc7cd681d10886b995a2830cb"
+dependencies = [
+ "cargo_toml 0.22.3",
+ "codepage",
+ "encoding_rs",
+ "eyre",
+ "owo-colors",
+ "pathsearch",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml 1.1.4+spec-1.1.0",
+ "url",
+ "winapi",
+]
+
+[[package]]
 name = "pgrx-pg-sys"
 version = "0.19.1"
 source = "git+https://github.com/pgcentralfoundation/pgrx.git?rev=58147f1a5d6168ef36be58200e6e4527cb6cc772#58147f1a5d6168ef36be58200e6e4527cb6cc772"
 dependencies = [
  "cee-scape",
  "libc",
- "pgrx-bindgen",
- "pgrx-macros",
- "pgrx-sql-entity-graph",
+ "pgrx-bindgen 0.19.1",
+ "pgrx-macros 0.19.1",
+ "pgrx-sql-entity-graph 0.19.1",
+ "serde",
+]
+
+[[package]]
+name = "pgrx-pg-sys"
+version = "0.19.2"
+source = "git+https://github.com/pgcentralfoundation/pgrx.git?rev=70383e884582d1bcc7cd681d10886b995a2830cb#70383e884582d1bcc7cd681d10886b995a2830cb"
+dependencies = [
+ "cee-scape",
+ "libc",
+ "pgrx-bindgen 0.19.2",
+ "pgrx-macros 0.19.2",
+ "pgrx-sql-entity-graph 0.19.2",
  "serde",
 ]
 
@@ -1758,6 +1839,21 @@ dependencies = [
 name = "pgrx-sql-entity-graph"
 version = "0.19.1"
 source = "git+https://github.com/pgcentralfoundation/pgrx.git?rev=58147f1a5d6168ef36be58200e6e4527cb6cc772#58147f1a5d6168ef36be58200e6e4527cb6cc772"
+dependencies = [
+ "convert_case",
+ "eyre",
+ "petgraph",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "thiserror",
+ "unescape",
+]
+
+[[package]]
+name = "pgrx-sql-entity-graph"
+version = "0.19.2"
+source = "git+https://github.com/pgcentralfoundation/pgrx.git?rev=70383e884582d1bcc7cd681d10886b995a2830cb#70383e884582d1bcc7cd681d10886b995a2830cb"
 dependencies = [
  "convert_case",
  "eyre",
@@ -1778,9 +1874,9 @@ dependencies = [
  "eyre",
  "libc",
  "owo-colors",
- "pgrx",
- "pgrx-macros",
- "pgrx-pg-config",
+ "pgrx 0.19.1",
+ "pgrx-macros 0.19.1",
+ "pgrx-pg-config 0.19.1",
  "postgres",
  "rand 0.10.2",
  "regex",
@@ -2125,7 +2221,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2601,7 +2697,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3316,7 +3412,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
