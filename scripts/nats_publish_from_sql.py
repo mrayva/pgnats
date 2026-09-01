@@ -282,9 +282,22 @@ def parse_args():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--sql", required=True,
+    p.add_argument("--sql", default=None,
                     help="Arbitrary SELECT statement producing the row set to publish "
-                         "(e.g. 'SELECT * FROM my_table WHERE ...').")
+                         "(e.g. 'SELECT * FROM my_table WHERE ...'). Required unless "
+                         "--source-table is given instead.")
+    p.add_argument("--source-table", default=None,
+                    help="Skip --sql's own per-run materialize-into-throwaway-table step "
+                         "(materialize_partitioned(): a real 'CREATE UNLOGGED TABLE ... AS "
+                         "SELECT' + COUNT(*), then a DROP TABLE at the end - genuine Postgres "
+                         "I/O, cache-state-dependent, can be tens of seconds on a 100M+ row "
+                         "table) and ctid-partition this ALREADY-EXISTING table directly "
+                         "instead, for repeated benchmark runs against the same static dataset. "
+                         "Equivalent to '--sql SELECT * FROM <name>' but never creates or drops "
+                         "any table - the table must already exist with the right columns "
+                         "(build it once, e.g. 'CREATE UNLOGGED TABLE snap AS SELECT ... FROM "
+                         "...'). Mutually exclusive with --sql. Must be a plain identifier "
+                         "(no schema-qualification/quoting) - validated below.")
     p.add_argument("--subject-columns", required=True,
                     help="Comma-separated column names (must be present in --sql's result). "
                          "Each row's subject is these columns' own values, dot-joined, "
@@ -1289,7 +1302,11 @@ def run_one_format_parallel(conn, args, fmt, subject_columns, all_columns):
     """
     metrics = {"format": fmt, "error": None, "workers": args.workers}
     batching = args.batch_size > 1
-    table_name = f"nats_bench_parallel_{uuid.uuid4().hex[:12]}"
+    # --source-table: reuse the caller's own persistent table directly (never created or dropped
+    # by this run) instead of the usual throwaway nats_bench_parallel_<uuid> copy - see
+    # --source-table's own --help text for why.
+    owns_table = not args.source_table
+    table_name = args.source_table or f"nats_bench_parallel_{uuid.uuid4().hex[:12]}"
     subject_expr = build_subject_expr(
         subject_columns, args.subject_prefix, fmt, args.subject_format_suffix, args.on_bad_subject_value
     )
@@ -1311,11 +1328,17 @@ def run_one_format_parallel(conn, args, fmt, subject_columns, all_columns):
                 return metrics
             print(f"  stream ready")
 
-        print(f"== [{fmt}] 1. Materializing --sql's rows ({args.workers} workers) ==")
-        total_rows = materialize_partitioned(conn, args.sql_stripped, args.limit, table_name)
+        if owns_table:
+            print(f"== [{fmt}] 1. Materializing --sql's rows ({args.workers} workers) ==")
+            total_rows = materialize_partitioned(conn, args.sql_stripped, args.limit, table_name)
+        else:
+            print(f"== [{fmt}] 1. Using existing --source-table {table_name!r} ({args.workers} workers) ==")
+            with conn.cursor() as cur:
+                cur.execute(sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier(table_name)))
+                total_rows = cur.fetchone()[0]
         bounds = ctid_page_bounds(conn, table_name, args.workers)
-        print(f"  {total_rows} row(s) materialized, partitioning by physical page range across "
-              f"{args.workers} worker(s)")
+        print(f"  {total_rows} row(s) {'materialized' if owns_table else 'found'}, partitioning by "
+              f"physical page range across {args.workers} worker(s)")
 
         step = 2
         if args.verify:
@@ -1482,8 +1505,9 @@ def run_one_format_parallel(conn, args, fmt, subject_columns, all_columns):
         metrics["error"] = f"publish failed: {e}"
         return metrics
     finally:
-        with conn.cursor() as cur:
-            cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(table_name)))
+        if owns_table:
+            with conn.cursor() as cur:
+                cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(table_name)))
         if consumer and consumer.poll() is None:
             consumer.kill()
         if dump_dir:
@@ -1774,6 +1798,23 @@ def print_comparison(results, verify, batching):
 def main():
     args = parse_args()
     formats = parse_formats(args.format)
+
+    if bool(args.sql) == bool(args.source_table):
+        sys.exit("error: exactly one of --sql or --source-table is required")
+    if args.source_table:
+        if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", args.source_table):
+            sys.exit(f"error: --source-table {args.source_table!r} must be a plain identifier "
+                      "(no schema-qualification/quoting/special characters)")
+        if args.workers <= 1 and not args.target_rate:
+            sys.exit("error: --source-table is only supported via the parallel path "
+                      "(--workers > 1 or --target-rate) - see materialize_partitioned()'s own "
+                      "single call site")
+        if args.limit is not None:
+            sys.exit("error: --limit is not supported with --source-table (materialize_partitioned() "
+                      "is what applies --limit; skipped entirely in this mode) - pre-limit the "
+                      "source table itself instead")
+        args.sql = f"SELECT * FROM {args.source_table}"
+
     args.sql_stripped = validate_sql(args.sql)
     subject_columns = parse_subject_columns(args.subject_columns)
 
